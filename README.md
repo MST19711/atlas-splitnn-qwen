@@ -310,16 +310,40 @@ podman build -f docker/Containerfile.v2 -t cann-atc-ubuntu22:v4 docker/
 ### 导出无KV Cache seq=32 的模型
 
 ```bash
-pixi run python scripts/export_fp16.py --seq-len 32 --output om_out/qwen3_fp16_seq32.onnx
+# 1. 导出 ONNX
+pixi run python scripts/export_fp16.py --seq-len 32 \
+    --output om_out/qwen3_fp16_seq32.onnx
 
+# 2. 验证: ONNX Runtime 推理 + left-padding 一致性
+pixi run python -c "
+import numpy as np, onnx, onnxruntime as ort
+onnx.checker.check_model('om_out/qwen3_fp16_seq32.onnx')
+sess = ort.InferenceSession('om_out/qwen3_fp16_seq32.onnx',
+                            providers=['CPUExecutionProvider'])
+# 全 1 mask
+a = sess.run(None, {'input_ids': np.ones((1,32),np.int64),
+                    'attention_mask': np.ones((1,32),np.int64)})[0]
+# left-padding: 只有最后 5 个 token 参与注意力
+m = np.zeros((1,32), np.int64); m[0,-5:] = 1
+b = sess.run(None, {'input_ids': np.ones((1,32),np.int64),
+                    'attention_mask': m})[0]
+np.testing.assert_allclose(a[0,-5:,:], b[0,-5:,:], rtol=0.01, atol=0.05)
+print('ONNX validation: PASS')
+"
+
+# 3. Patch GQA Expand → Tile
 pixi run python scripts/patch_onnx.py \
     om_out/qwen3_fp16_seq32.onnx \
     --output om_out/qwen3_fp16_seq32_tile.onnx --seq-len 32
 
+# 4. 再次验证修补后的 ONNX（同上，略）
+
+# 5. ATC 转 OM
 MODEL_ONNX=om_out/qwen3_fp16_seq32_tile.onnx \
 INPUT_SHAPE="input_ids:1,32;attention_mask:1,32" \
 bash scripts/podman_convert.sh
 
+# 6. 传输到开发板
 sshpass -p 'Mind@123' scp om_out/qwen3_fp16_seq32_tile.om \
     root@192.168.137.100:/root/slm_deploy/
 ```
@@ -327,27 +351,94 @@ sshpass -p 'Mind@123' scp om_out/qwen3_fp16_seq32_tile.om \
 ### 导出支持 KV Cache 的模型
 
 ```bash
+# 1. 导出 ONNX
 pixi run python scripts/export_kvcache.py --max-len 256 \
     --output om_out/qwen3_kvcache_max256.onnx
 
+# 2. 验证: 单步 logits 与 PyTorch 原版一致
+pixi run python -c "
+import torch, numpy as np, onnx, onnxruntime as ort
+from transformers import AutoModelForCausalLM
+from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention, Qwen3DecoderLayer
+import sys; sys.path.insert(0,'scripts')
+from export_kvcache import (_patched_attention_forward,
+    _patched_decoder_forward, KVCacheWrapper)
+
+# PyTorch baseline
+m = AutoModelForCausalLM.from_pretrained('model/Qwen3-0.6B',
+    torch_dtype=torch.float16, device_map='cpu', trust_remote_code=True).eval()
+with torch.no_grad():
+    bl = m(torch.tensor([[100]], dtype=torch.long), use_cache=False).logits
+
+# Patched PyTorch
+Qwen3Attention.forward = _patched_attention_forward
+Qwen3DecoderLayer.forward = _patched_decoder_forward
+w = KVCacheWrapper(m, 256).eval()
+pos = torch.tensor([0], dtype=torch.int64)
+kv = [torch.zeros(1,8,256,128, dtype=torch.float16) for _ in range(56)]
+out_pt = w(torch.tensor([[100]], dtype=torch.long), pos, *kv)
+
+assert torch.allclose(bl.float(), out_pt[0].float(), rtol=0.01, atol=0.1)
+print('PyTorch patched vs baseline: PASS')
+
+# ONNX Runtime
+onnx.checker.check_model('om_out/qwen3_kvcache_max256.onnx')
+sess = ort.InferenceSession('om_out/qwen3_kvcache_max256.onnx',
+                            providers=['CPUExecutionProvider'])
+feed = {'input_ids': np.array([[100]], np.int64),
+        'position': np.array([0], np.int64)}
+for i in range(28):
+    feed[f'past_k_{i}'] = np.zeros((1,8,256,128), np.float16)
+    feed[f'past_v_{i}'] = np.zeros((1,8,256,128), np.float16)
+ort_out = sess.run(None, feed)[0]
+assert np.allclose(out_pt[0].numpy().astype(np.float16), ort_out, rtol=0.01, atol=0.1)
+print('ORT vs PyTorch: PASS')
+"
+
+# 3. 验证: ORT 多步生成（K/V 缓存正确积累）
+pixi run python -c "
+import numpy as np, onnxruntime as ort
+sess = ort.InferenceSession('om_out/qwen3_kvcache_max256.onnx')
+kv = {}
+for i in range(28):
+    kv[f'k_{i}'] = np.zeros((1,8,256,128), np.float16)
+    kv[f'v_{i}'] = np.zeros((1,8,256,128), np.float16)
+# 3 步 prefill + 2 步 decode
+for pos in range(5):
+    feed = {'input_ids': np.array([[pos+100]], np.int64),
+            'position': np.array([pos], np.int64)}
+    for i in range(28):
+        feed[f'past_k_{i}'] = kv[f'k_{i}']
+        feed[f'past_v_{i}'] = kv[f'v_{i}']
+    outs = sess.run(None, feed)
+    for i in range(28):
+        kv[f'k_{i}'] = outs[1 + 2*i]
+        kv[f'v_{i}'] = outs[1 + 2*i + 1]
+# 检查前 3 个位置有非零 K 值
+assert np.count_nonzero(kv['k_0'][0,:,0,:]) > 0, 'Position 0 unfilled'
+assert np.count_nonzero(kv['k_0'][0,:,2,:]) > 0, 'Position 2 unfilled'
+print('Multi-step KV accumulation: PASS')
+"
+
+# 4. ATC 转 OM
 INPUT_SHAPE=$(pixi run python -c "
 import onnx
 m = onnx.load('om_out/qwen3_kvcache_max256.onnx')
 print(';'.join(i.name+':'+','.join(str(d.dim_value)
     for d in i.type.tensor_type.shape.dim) for i in m.graph.input))
 ")
-
 MODEL_ONNX=om_out/qwen3_kvcache_max256.onnx \
 INPUT_SHAPE="$INPUT_SHAPE" \
 bash scripts/podman_convert.sh
 
+# 5. 传输到开发板
 sshpass -p 'Mind@123' scp om_out/qwen3_kvcache_max256.om \
     root@192.168.137.100:/root/slm_deploy/
 ```
 
 
 ### 准备开发板环境
-
+（网络配置方法和CANN 8.0运行时安装方法详见官方文档）
 ```bash
 # 1. SSH 登录
 ssh root@192.168.137.100   # 密码 Mind@123
