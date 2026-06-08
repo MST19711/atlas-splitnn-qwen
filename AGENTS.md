@@ -52,7 +52,7 @@ bash scripts/podman_convert.sh
 ## 踩坑速查
 1. **ACL API**: `acl.mdl.add_dataset_buffer(ds,buf)` 返回 tuple `(ptr,ret)`, 需 `_, ret = ...`
 2. **TBE ccec**: `tbe/tvm/contrib/ccec.py` 硬编码 `/usr/local/Ascend/CANN-1.84/` → 容器内 symlink
-3. **310B内核**: 必须用 `Ascend-cann-kernels-310b` (非 310P), 否则 soc_version=Ascend310B4 失败
+3. **310B内核**: 必须用 `Ascend-cann-kernels-310b` (非 310P 或其他型号), 否则 soc_version=Ascend310B4 失败
 4. **GQA Expand**: seq=N 导出后需 `patch_onnx.py` 修复 56 个动态 Expand
 5. **thinking**: Qwen3 0.6B 需 `enable_thinking=False`
 6. **NPU 泄漏**: kill 后内存不释放 → reboot
