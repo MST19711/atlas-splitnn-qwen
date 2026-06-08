@@ -4,12 +4,12 @@ FROM localhost/cann-atc-ubuntu22
 RUN apt-get update && apt-get install -y --no-install-recommends python3-pip && rm -rf /var/lib/apt/lists/*
 
 COPY cann-toolkit.run /tmp/cann-toolkit.run
-COPY opp-kernel-310p.run /tmp/opp-kernel-310p.run
+COPY opp-kernel-310b.run /tmp/opp-kernel-310b.run
 
-RUN chmod +x /tmp/cann-toolkit.run /tmp/opp-kernel-310p.run \
+RUN chmod +x /tmp/cann-toolkit.run /tmp/opp-kernel-310b.run \
  && echo "y" | /tmp/cann-toolkit.run --quiet --nox11 --install \
-      --install-path=/usr/local/Ascend/cann --chip=Ascend310P \
- && echo "y" | /tmp/opp-kernel-310p.run --quiet --full \
+      --install-path=/usr/local/Ascend/cann \
+ && echo "y" | /tmp/opp-kernel-310b.run --quiet --full \
       --install-path=/usr/local/Ascend/cann
 
 # Fix TBE hardcoded ccec path
@@ -27,4 +27,4 @@ ENV PATH=${CANN_BASE}/x86_64-linux/bin:${CANN_BASE}/compiler/bin:${PATH}
 ENV LD_LIBRARY_PATH=${CANN_BASE}/x86_64-linux/lib64:${CANN_BASE}/compiler/lib64:${CANN_BASE}/x86_64-linux/devlib:${CANN_BASE}/runtime/lib64/stub:${LD_LIBRARY_PATH}
 ENV PYTHONPATH=${CANN_BASE}/python/site-packages:${CANN_BASE}/compiler/python/site-packages
 
-RUN rm -f /tmp/cann-toolkit.run /tmp/opp-kernel-310p.run
+RUN rm -f /tmp/cann-toolkit.run /tmp/opp-kernel-310b.run

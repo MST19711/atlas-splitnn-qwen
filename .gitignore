@@ -22,3 +22,4 @@ atc_monitor.sh
 cann_install/
 __pycache__/
 docker/*.run
+cann_install/
