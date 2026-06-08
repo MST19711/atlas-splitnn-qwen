@@ -1,20 +1,21 @@
-# DeepSeek-Atlas-Chat is tracked in its own repo
-# (referenced as git submodule/gitlink)
-
-# Large files
+# Model artifacts
 *.onnx
 *.onnx.data
 *.om
 *.log
 *.safetensors
-models/
+model/
 
-# CANN / build artifacts
+# CANN / build
 cann8_install/
 kernel_meta/
 om_out/
 logs/
 
-# IDE / tools
+# Python
+.pixi/
+
+# IDE
 .codegraph/
 .opencode/
+atc_monitor.sh
