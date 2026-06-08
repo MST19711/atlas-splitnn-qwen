@@ -314,7 +314,7 @@ podman build -f docker/Containerfile.v2 -t cann-atc-ubuntu22:v4 docker/
 pixi run python scripts/export_fp16.py --seq-len 32 \
     --output om_out/qwen3_fp16_seq32.onnx
 
-# 2. 验证: ONNX Runtime 推理 + left-padding 一致性
+# 2. (可选) 验证: ONNX Runtime 推理 + left-padding 一致性
 pixi run python -c "
 import numpy as np, onnx, onnxruntime as ort
 onnx.checker.check_model('om_out/qwen3_fp16_seq32.onnx')
@@ -336,7 +336,7 @@ pixi run python scripts/patch_onnx.py \
     om_out/qwen3_fp16_seq32.onnx \
     --output om_out/qwen3_fp16_seq32_tile.onnx --seq-len 32
 
-# 4. 再次验证修补后的 ONNX（同上，略）
+# 4. (可选) 再次验证修补后的 ONNX（同上，略）
 
 # 5. ATC 转 OM
 MODEL_ONNX=om_out/qwen3_fp16_seq32_tile.onnx \
@@ -355,7 +355,7 @@ sshpass -p 'Mind@123' scp om_out/qwen3_fp16_seq32_tile.om \
 pixi run python scripts/export_kvcache.py --max-len 256 \
     --output om_out/qwen3_kvcache_max256.onnx
 
-# 2. 验证: 单步 logits 与 PyTorch 原版一致
+# 2. (可选) 验证: 单步 logits 与 PyTorch 原版一致
 pixi run python -c "
 import torch, numpy as np, onnx, onnxruntime as ort
 from transformers import AutoModelForCausalLM
@@ -395,7 +395,7 @@ assert np.allclose(out_pt[0].numpy().astype(np.float16), ort_out, rtol=0.01, ato
 print('ORT vs PyTorch: PASS')
 "
 
-# 3. 验证: ORT 多步生成（K/V 缓存正确积累）
+# 3. (可选) 验证: ORT 多步生成（K/V 缓存正确积累）
 pixi run python -c "
 import numpy as np, onnxruntime as ort
 sess = ort.InferenceSession('om_out/qwen3_kvcache_max256.onnx')
