@@ -37,7 +37,7 @@ atc --model=${_ATC_MODEL} \
     --output=${_ATC_OUTPUT} \
     --input_format=ND \
     --input_shape="${_ATC_SHAPE}" \
-    --soc_version=Ascend310P1 \
+    --soc_version=Ascend310B4 \
     --precision_mode=allow_fp32_to_fp16 \
     --log=info
 echo "--- atc done ---"
