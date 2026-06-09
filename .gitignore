@@ -22,6 +22,7 @@ atc_monitor.sh
 cann_install/
 __pycache__/
 docker/*.run
+docker/*.rpm
 cann_install/
 docker/b4_data/
 fusion_result.json

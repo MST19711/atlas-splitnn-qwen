@@ -177,6 +177,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/yaml-0.2.5-h280c20c_3.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_6.conda
       - pypi: https://files.pythonhosted.org/packages/e2/b7/0dc1b28dd2345398205ce257a341b0ebde5c91a587c4253d418a46928bf7/onnxsim-0.6.4-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+      - pypi: https://files.pythonhosted.org/packages/c8/89/8deeafbba2871e8fa10f20f17447786f4ac38085925335728d360eaf4cae/sentencepiece-0.2.1-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
   build_number: 20
@@ -1703,6 +1704,14 @@ packages:
   - pkg:pypi/scipy?source=hash-mapping
   size: 16523290
   timestamp: 1716471188947
+- pypi: https://files.pythonhosted.org/packages/c8/89/8deeafbba2871e8fa10f20f17447786f4ac38085925335728d360eaf4cae/sentencepiece-0.2.1-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+  name: sentencepiece
+  version: 0.2.1
+  sha256: 27e38eee653abc3d387862e67bc5c8b6f428cd604e688b85d29170b7e725c26c
+  requires_dist:
+  - pytest ; extra == 'test'
+  - test ; extra == 'testpaths'
+  requires_python: '>=3.9'
 - conda: https://conda.anaconda.org/conda-forge/noarch/setuptools-80.9.0-pyhff2d567_0.conda
   sha256: 972560fcf9657058e3e1f97186cc94389144b46dbdf58c807ce62e83f977e863
   md5: 4de79c071274a53dcaf2a8c749d1499e

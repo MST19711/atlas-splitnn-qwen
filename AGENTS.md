@@ -18,19 +18,21 @@
 ## 项目结构
 ```
 scripts/        # ONNX 导出 + ATC 转换 (x86 dev)
-  export_fp16.py      seq=N 静态导出
-  export_kvcache.py   KV Cache 导出 (monkey-patch Qwen3Attention)
-  patch_onnx.py       GQA Expand→Tile
-  download_model.py
+  export_fp16.py        seq=N 静态导出
+  export_kvcache.py     KV Cache 导出 (monkey-patch Qwen3Attention)
+  export_qwen35.py      Qwen3.5 KV Cache 导出 (DeltaNet monkey-patch)
+  patch_onnx.py         GQA Expand→Tile
   podman_convert.sh
 board/          # 板载推理 (aarch64)
-  gen_text_seq32.py     seq=32 滑动窗口
-  gen_text_kvcache.py   KV Cache (max_len=256)
-  acl_verify.py         ACL 验证
-docker/Containerfile.v2 # CANN 8.0 + 310B 内核, 镜像: cann-atc-ubuntu22:v4
-model/Qwen3-0.6B/       # 模型权重 + tokenizer
+  gen_text_seq32.py       seq=32 滑动窗口
+  gen_text_kvcache.py     Qwen3 KV Cache (max_len=256)
+  gen_text_qwen35.py      Qwen3.5 KV Cache (max_len=256, DeltaNet)
+  acl_verify.py           ACL 验证
+docker/
+  Containerfile.v2-cann7  # CANN 7.0 + 310B 内核 (Rocky 9), 镜像: cann-atc-rocky:v7
+model/
+  Qwen3-0.6B/             # Qwen3 模型权重 + tokenizer
 om_out/ logs/
-ARCHIVE.md              # 完整文档 (人类阅读)
 ```
 
 ## ATC 转换
@@ -38,16 +40,27 @@ ARCHIVE.md              # 完整文档 (人类阅读)
 # 示例
 MODEL_ONNX=om_out/model.onnx \
 INPUT_SHAPE="name1:d1,d2;name2:d1,d2" \
+IMAGE=localhost/cann-atc-rocky:v7 \
 bash scripts/podman_convert.sh
 ```
-- 镜像 `cann-atc-ubuntu22:v4`, CANN 内置, soc_version=`Ascend310B4`
-- 需传入 INPUT_SHAPE, MODEL_ONNX, 可选 OUTPUT_PREFIX
+- 镜像 `cann-atc-rocky:v7`, CANN 7.0 (实际安装版本 7.1.0.3.220)
+- soc_version=`Ascend310B4`
+- 需传入 INPUT_SHAPE, MODEL_ONNX, 可选 OUTPUT_PREFIX, IMAGE
+
+## ATC 容器构建
+```bash
+# 下载 CANN 7.0.0 安装包到 docker/
+# 1. toolkit: Ascend-cann-toolkit_7.0.0_linux-x86_64.run (1.6GB)
+# 2. kernel: Ascend-cann-kernels-310b-7.0.0-linux.noarch.rpm (351MB)
+podman build --network=host -t localhost/cann-atc-rocky:v7 \
+    -f docker/Containerfile.v2-cann7 docker/
+```
 
 ## 当前模型
 | 模型 | 文件 | 速度 | 上下文 |
 |------|------|------|--------|
-| seq=32 Tile | om_out/qwen3_fp16_seq32_tile.om | 3.6 tok/s | 32 tok |
-| KV Cache | om_out/qwen3_kvcache_max256.om | 4.8 tok/s | 256 tok |
+| Qwen3 KV Cache | om_out/qwen3_kvcache_max256_cann7.om | 0.8 tok/s | 256 tok |
+| Qwen3.5 KV Cache | om_out/qwen3.5_kvcache_max256_cann7.om | 0.1 tok/s | 256 tok |
 
 ## 踩坑速查
 1. **ACL API**: `acl.mdl.add_dataset_buffer(ds,buf)` 返回 tuple `(ptr,ret)`, 需 `_, ret = ...`
@@ -56,10 +69,18 @@ bash scripts/podman_convert.sh
 4. **GQA Expand**: seq=N 导出后需 `patch_onnx.py` 修复 56 个动态 Expand
 5. **thinking**: Qwen3 0.6B 需 `enable_thinking=False`
 6. **NPU 泄漏**: kill 后内存不释放 → reboot
-7. **pip3**: CANN 8.0 compiler 依赖, Containerfile 已处理
+7. **numpy<2**: CANN 7 TBE 不兼容 numpy 2.x, 需要 `pip3 install 'numpy<2'`
+8. **TBE 依赖**: 需 `pip3 install attrs cloudpickle psutil synr tornado` (te 包依赖)
+9. **gcc-c++**: CCE 编译器需要 C++ 标准库头文件, 容器需 `dnf install gcc-c++`
+10. **tokenizer 混乱**: Qwen3 和 Qwen3.5 的 tokenizer 文件互不兼容, SCP 时注意不要互相覆盖
 
 ## 导出 KV Cache 模型
 ```bash
+# Qwen3
 pixi run python scripts/export_kvcache.py --max-len 256 --output om_out/qwen3_kvcache_max256.onnx
-# ORT 多步验证通过 → ATC → SCP → board/gen_text_kvcache.py
+
+# Qwen3.5
+pixi run python scripts/export_qwen35.py --max-len 256 --output om_out/qwen3.5_kvcache_max256.onnx
+
+# ORT 多步验证 → ATC → SCP → board/gen_text_kvcache.py
 ```

@@ -36,3 +36,4 @@ cann-py39 = { features = ["cann-py39"], no-default-feature = true }
 
 [pypi-dependencies]
 onnxsim = ">=0.6.4, <0.7"
+sentencepiece = ">=0.2.1, <0.3"
