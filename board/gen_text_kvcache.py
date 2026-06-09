@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Qwen3-0.6B KV Cache ACL inference on Atlas 200I DK A2."""
+"""Qwen3-0.6B KV Cache ACL inference on Atlas 200I DK A2.
+v3: pre-created double datasets AB/BA.
+Fixed: output data buffer lifecycle, added validation logging."""
+
 import argparse, sys, time, warnings, numpy as np
 
 warnings.filterwarnings("ignore")
@@ -12,91 +15,153 @@ MAX, NL = 256, 28
 KV_BYTES = 8 * MAX * 128 * 2
 
 
-def check(r, m):
-    if r != 0: raise RuntimeError(f"{m} failed, ret={r}")
+def check(ret, msg):
+    if ret != 0:
+        raise RuntimeError(f"[{msg}] failed, ret={ret}")
+
+
+def _make_dataset(dev_ids, dev_pos, kv_src, dev_logits, kv_dst, tag):
+    """Return (ds_in, ds_out, bufs_in, bufs_out)."""
+    ds_in = acl.mdl.create_dataset()
+    ds_out = acl.mdl.create_dataset()
+    bufs_in, bufs_out = [], []
+
+    # inputs: ids, position, 56 K/V
+    for idx, (ptr, sz) in enumerate([(dev_ids, 8), (dev_pos, 8)] +
+                                     [(p, KV_BYTES) for p in kv_src]):
+        b = acl.create_data_buffer(ptr, sz)
+        assert b != 0, f"{tag} create_data_buffer in[{idx}] returned 0"
+        _, ret = acl.mdl.add_dataset_buffer(ds_in, b)
+        check(ret, f"{tag} add_dataset_buffer in[{idx}]")
+        bufs_in.append(b)
+
+    # outputs: logits + 56 K/V
+    b = acl.create_data_buffer(dev_logits, 303872)
+    assert b != 0, f"{tag} create_data_buffer out[logits] returned 0"
+    _, ret = acl.mdl.add_dataset_buffer(ds_out, b)
+    check(ret, f"{tag} add_dataset_buffer out[logits]")
+    bufs_out.append(b)
+    for idx, ptr in enumerate(kv_dst):
+        b = acl.create_data_buffer(ptr, KV_BYTES)
+        assert b != 0, f"{tag} create_data_buffer out[K/V {idx}] returned 0"
+        _, ret = acl.mdl.add_dataset_buffer(ds_out, b)
+        check(ret, f"{tag} add_dataset_buffer out[K/V {idx}]")
+        bufs_out.append(b)
+
+    print(f"  {tag} created: ds_in ok, ds_out ok, "
+          f"{len(bufs_in)} in bufs, {len(bufs_out)} out bufs")
+    return ds_in, ds_out, bufs_in, bufs_out
 
 
 class ACLModel:
     def __init__(self, path):
+        print("[init] acl.init...")
         check(acl.init(), "init")
+        print("[init] acl.rt.set_device(0)...")
         check(acl.rt.set_device(0), "set_device")
+        print("[init] acl.mdl.load_from_file...")
         self.mid, ret = acl.mdl.load_from_file(path)
-        check(ret, "load")
+        check(ret, "load_from_file")
+        print("[init] model loaded")
         self.desc = acl.mdl.create_desc()
         check(acl.mdl.get_desc(self.desc, self.mid), "get_desc")
-        self.out_sz_logits = acl.mdl.get_output_size_by_index(self.desc, 0)
-        self.n_in = acl.mdl.get_num_inputs(self.desc)
-        self.n_out = acl.mdl.get_num_outputs(self.desc)
-        print(f"  I/O: {self.n_in} in, {self.n_out} out")
+        self.out_sz = acl.mdl.get_output_size_by_index(self.desc, 0)
+        print(f"  I/O: {acl.mdl.get_num_inputs(self.desc)} in, "
+              f"{acl.mdl.get_num_outputs(self.desc)} out")
 
-    def execute(self, token_id, position, kv_dev):
-        """kv_dev: list of 56 device pointers. Returns logits array + updates kv_dev in-place."""
-        ds_in = acl.mdl.create_dataset()
-        ds_out = acl.mdl.create_dataset()
-        bufs, ptrs = [], []
+        self._allocated = []
 
-        try:
-            # input_ids (1,1) int64
-            inp = np.array([[token_id]], dtype=np.int64)
-            pi, _ = acl.rt.malloc(8, M); ptrs.append(pi)
-            acl.rt.memcpy(pi, 8, inp.ctypes.data, 8, H2D)
-            b = acl.create_data_buffer(pi, 8); bufs.append(b)
-            _, ret = acl.mdl.add_dataset_buffer(ds_in, b); check(ret, "add_inp")
+        print("[init] alloc dev_ids(8)...")
+        self._dev_ids, _ = acl.rt.malloc(8, M); assert self._dev_ids
+        self._allocated.append(self._dev_ids)
+        print(f"  dev_ids={hex(self._dev_ids)}")
 
-            # position (1,) int64
-            pos = np.array([position], dtype=np.int64)
-            pp, _ = acl.rt.malloc(8, M); ptrs.append(pp)
-            acl.rt.memcpy(pp, 8, pos.ctypes.data, 8, H2D)
-            b = acl.create_data_buffer(pp, 8); bufs.append(b)
-            _, ret = acl.mdl.add_dataset_buffer(ds_in, b); check(ret, "add_pos")
+        print("[init] alloc dev_pos(8)...")
+        self._dev_pos, _ = acl.rt.malloc(8, M); assert self._dev_pos
+        self._allocated.append(self._dev_pos)
+        print(f"  dev_pos={hex(self._dev_pos)}")
 
-            # past K/V (56 device pointers)
-            for ptr in kv_dev:
-                b = acl.create_data_buffer(ptr, KV_BYTES); bufs.append(b)
-                _, ret = acl.mdl.add_dataset_buffer(ds_in, b); check(ret, "add_kv")
+        print("[init] alloc dev_logits...")
+        self._dev_logits, _ = acl.rt.malloc(self.out_sz, M)
+        assert self._dev_logits
+        self._allocated.append(self._dev_logits)
+        print(f"  dev_logits={hex(self._dev_logits)}")
 
-            # Output buffers: logits + 56 K/V
-            out_host = []
-            out_dev = []
-            # logits
-            po, _ = acl.rt.malloc(self.out_sz_logits, M); ptrs.append(po)
-            b = acl.create_data_buffer(po, self.out_sz_logits)
-            _, ret = acl.mdl.add_dataset_buffer(ds_out, b); check(ret, "add_out_logits")
-            bufs.append(b); out_dev.append(po)
-            host_lg = np.empty(self.out_sz_logits, np.uint8); out_host.append(host_lg)
+        print("[init] alloc K/V double buffers...")
+        kv_a, kv_b = [], []
+        for i in range(2 * NL):
+            pa, _ = acl.rt.malloc(KV_BYTES, M)
+            assert pa != 0, f"malloc kv_a[{i}] returned 0"
+            kv_a.append(pa); self._allocated.append(pa)
+            pb, _ = acl.rt.malloc(KV_BYTES, M)
+            assert pb != 0, f"malloc kv_b[{i}] returned 0"
+            kv_b.append(pb); self._allocated.append(pb)
+        print(f"  K/V allocated: {len(kv_a)}+{len(kv_b)} = {len(self._allocated)-3} tensors")
 
-            # present K/V
-            for _ in range(2 * NL):
-                p, _ = acl.rt.malloc(KV_BYTES, M); ptrs.append(p)
-                b = acl.create_data_buffer(p, KV_BYTES)
-                _, ret = acl.mdl.add_dataset_buffer(ds_out, b); check(ret, "add_out_kv")
-                bufs.append(b); out_dev.append(p)
-                out_host.append(np.empty(KV_BYTES, np.uint8))
+        # Pre-create two dataset pairs
+        print("[init] creating dataset pair AB...")
+        self._ds_in_AB, self._ds_out_AB, self._bufs_in_AB, self._bufs_out_AB = \
+            _make_dataset(self._dev_ids, self._dev_pos, kv_a, self._dev_logits, kv_b, "AB")
 
-            check(acl.mdl.execute(self.mid, ds_in, ds_out), "execute")
+        print("[init] creating dataset pair BA...")
+        self._ds_in_BA, self._ds_out_BA, self._bufs_in_BA, self._bufs_out_BA = \
+            _make_dataset(self._dev_ids, self._dev_pos, kv_b, self._dev_logits, kv_a, "BA")
 
-            # D2H all outputs
-            for i, (dev, host) in enumerate(zip(out_dev, out_host)):
-                acl.rt.memcpy(host.ctypes.data, host.nbytes, dev, host.nbytes, D2H)
+        print("[init] datasets created successfully!")
+        print(f"  bufs_in_AB={len(self._bufs_in_AB)}, bufs_out_AB={len(self._bufs_out_AB)}")
+        print(f"  bufs_in_BA={len(self._bufs_in_BA)}, bufs_out_BA={len(self._bufs_out_BA)}")
 
-            logits = out_host[0].view(np.float16).flatten()
+        # Host staging
+        self._host_ids = np.empty(8, np.uint8)
+        self._host_pos = np.empty(8, np.uint8)
+        self._host_logits = np.empty(self.out_sz, np.uint8)
 
-            # Copy updated K/V from output back to input device buffers
-            for i in range(2 * NL):
-                out_host_kv = out_host[1 + i]
-                acl.rt.memcpy(kv_dev[i], KV_BYTES, out_host_kv.ctypes.data, KV_BYTES, H2D)
+        self._step = 0
 
-            return logits
+    def execute(self, token_id, position):
+        self._host_ids[:8] = np.array([token_id], np.int64).view(np.uint8)
+        self._host_pos[:8] = np.array([position], np.int64).view(np.uint8)
+        acl.rt.memcpy(self._dev_ids, 8, self._host_ids.ctypes.data, 8, H2D)
+        acl.rt.memcpy(self._dev_pos, 8, self._host_pos.ctypes.data, 8, H2D)
 
-        finally:
-            for b in bufs: acl.destroy_data_buffer(b)
-            acl.mdl.destroy_dataset(ds_in); acl.mdl.destroy_dataset(ds_out)
-            for p in ptrs: acl.rt.free(p)
+        if self._step % 2 == 0:
+            ds_in, ds_out = self._ds_in_AB, self._ds_out_AB
+        else:
+            ds_in, ds_out = self._ds_in_BA, self._ds_out_BA
+        self._step += 1
+
+        print(f"[step {self._step}] pre-execute, ds_in ok, ds_out ok")
+        check(acl.mdl.execute(self.mid, ds_in, ds_out), "execute")
+        print(f"[step {self._step}] post-execute")
+
+        acl.rt.memcpy(self._host_logits.ctypes.data, self.out_sz,
+                      self._dev_logits, self.out_sz, D2H)
+        print(f"[step {self._step}] D2H logits ok, nonzero={np.count_nonzero(self._host_logits)}")
+        return self._host_logits.view(np.float16).flatten()
 
     def close(self):
+        print("[close] destroying all data buffers...")
+        for tag, bufs_in, bufs_out in [
+            ("AB_in", self._bufs_in_AB, None),
+            ("AB_out", self._bufs_out_AB, None),
+            ("BA_in", self._bufs_in_BA, None),
+            ("BA_out", self._bufs_out_BA, None),
+        ]:
+            for b in (bufs_in or []):
+                acl.destroy_data_buffer(b)
+        print("[close] destroying datasets...")
+        acl.mdl.destroy_dataset(self._ds_in_AB)
+        acl.mdl.destroy_dataset(self._ds_out_AB)
+        acl.mdl.destroy_dataset(self._ds_in_BA)
+        acl.mdl.destroy_dataset(self._ds_out_BA)
+        print("[close] freeing device memory...")
+        for p in self._allocated:
+            acl.rt.free(p)
+        print("[close] unload, reset, finalize...")
         check(acl.mdl.unload(self.mid), "unload")
         check(acl.rt.reset_device(0), "reset_device")
         check(acl.finalize(), "finalize")
+        print("[close] done")
 
 
 def sample(logits, temp=0.7, top_k=50, top_p=0.9):
@@ -113,51 +178,41 @@ def sample(logits, temp=0.7, top_k=50, top_p=0.9):
     return int(np.random.choice(len(p), p=p))
 
 
-def generate(model, tok, prompt, max_new=30, temp=0.7, top_k=40, top_p=0.9):
+def generate(model, tok, prompt, max_new=5, temp=0.7, top_k=40, top_p=0.9):
     prompt_ids = tok.encode(prompt, add_special_tokens=False)
     n_prompt = min(len(prompt_ids), MAX)
     prompt_ids = prompt_ids[-n_prompt:]
     print(f"[Prompt: {n_prompt} tokens]\n")
 
-    # Allocate KV cache on device
-    kv_dev = []
-    for _ in range(2 * NL):
-        p, ret = acl.rt.malloc(KV_BYTES, M); check(ret, "malloc kv")
-        kv_dev.append(p)
-    try:
-        t0 = time.time()
+    t0 = time.time()
 
-        # Prefill
-        for pos, tid in enumerate(prompt_ids):
-            model.execute(int(tid), pos, kv_dev)
+    for pos, tid in enumerate(prompt_ids):
+        model.execute(int(tid), pos)
 
-        # Decode
-        current_id = int(prompt_ids[-1])
-        n_gen = 0
-        for step in range(max_new):
-            pos = n_prompt + step
-            if pos >= MAX: break
-            logits = model.execute(current_id, pos, kv_dev)
-            tid = sample(logits, temp, top_k, top_p)
-            if tid == tok.eos_token_id: break
-            current_id = tid; n_gen += 1
-            txt = tok.decode([tid], skip_special_tokens=True)
-            sys.stdout.write(txt); sys.stdout.flush()
+    current_id = int(prompt_ids[-1])
+    n_gen = 0
+    for step in range(max_new):
+        pos = n_prompt + step
+        if pos >= MAX: break
+        logits = model.execute(current_id, pos)
+        tid = sample(logits, temp, top_k, top_p)
+        if tid == tok.eos_token_id: break
+        current_id = tid; n_gen += 1
+        txt = tok.decode([tid], skip_special_tokens=True)
+        sys.stdout.write(txt); sys.stdout.flush()
 
-        dt = time.time() - t0
-        tok_s = n_gen / dt if dt > 0 else 0
-        ms = dt / n_gen * 1000 if n_gen else 0
-        print(f"\n\n[{n_gen} tok, {dt:.1f}s, {tok_s:.1f} tok/s, {ms:.0f} ms/tok]")
-    finally:
-        for p in kv_dev: acl.rt.free(p)
+    dt = time.time() - t0
+    tok_s = n_gen / dt if dt > 0 else 0
+    ms = dt / n_gen * 1000 if n_gen else 0
+    print(f"\n\n[{n_gen} tok, {dt:.1f}s, {tok_s:.1f} tok/s, {ms:.0f} ms/tok]")
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="/root/slm_deploy/qwen3_kvcache_max256_b4.om")
     p.add_argument("--tokenizer-dir", default="/root/slm_deploy")
-    p.add_argument("--prompt", default="你好，请介绍一下你自己")
-    p.add_argument("--max-tokens", type=int, default=30)
+    p.add_argument("--prompt", default="你好")
+    p.add_argument("--max-tokens", type=int, default=5)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top-k", type=int, default=40)
     p.add_argument("--top-p", type=float, default=0.9)
@@ -165,7 +220,8 @@ def main():
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer_dir, trust_remote_code=True)
     msgs = [{"role": "user", "content": args.prompt}]
-    formatted = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+    formatted = tok.apply_chat_template(msgs, tokenize=False,
+                                        add_generation_prompt=True, enable_thinking=False)
 
     print(f"Model: {args.model}")
     model = ACLModel(args.model)
