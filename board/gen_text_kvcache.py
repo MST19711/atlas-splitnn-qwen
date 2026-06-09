@@ -130,13 +130,13 @@ class ACLModel:
             ds_in, ds_out = self._ds_in_BA, self._ds_out_BA
         self._step += 1
 
-        print(f"[step {self._step}] pre-execute, ds_in ok, ds_out ok")
+        # debug
         check(acl.mdl.execute(self.mid, ds_in, ds_out), "execute")
-        print(f"[step {self._step}] post-execute")
+        # debug
 
         acl.rt.memcpy(self._host_logits.ctypes.data, self.out_sz,
                       self._dev_logits, self.out_sz, D2H)
-        print(f"[step {self._step}] D2H logits ok, nonzero={np.count_nonzero(self._host_logits)}")
+        # debug
         return self._host_logits.view(np.float16).flatten()
 
     def close(self):

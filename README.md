@@ -36,10 +36,9 @@
 | 方案 | 上下文长度 | 每 token 耗时 | 解码速度* | 输出质量 |
 |------|-----------|-------------|----------|---------|
 | 静态窗口 (seq=32) | 32 token | ~280 ms | 3.6 tok/s | 连贯中文 |
-| KV Cache (max_len=256) | 256 token | ~210 ms | 4.8 tok/s | 连贯中文 |
+| KV Cache (max_len=256) | 256 token | ~400 ms | 2.5 tok/s (解码) / 1.3 tok/s (含 prefill) | 连贯中文 |
 
-> *解码速度 = 纯生成阶段速度（不含 prompt）。OM 首次加载约 75 秒，后续每 token 约 210ms，达到当前
-> NPU 计算 174ms 的理论下限附近（剩余 ~36ms 为 H2D/D2H/Python 采样开销）。
+> *OM 首次加载约 75 秒。每步约 400ms，Profiler 显示 NPU 纯计算 174ms，剩余 226ms 为 ACL 框架调用和 Python 采样开销。
 
 模型输出示例：
 
@@ -288,7 +287,7 @@ K/V 留在 device 内存，指针身份互换
 （全部数据结构在模型生命周期内一次性创建）
 ```
 
-最终每步约 210ms。因为 NPU 计算 174ms 是理论下限，剩余的 ~36ms 是 H2D/D2H/Python 采样的固定开销。
+最终每步约 400ms（Profiler 显示 NPU 纯计算 174ms，剩余 ~226ms 为 ACL 框架调用和 Python 采样开销，受限于 CANN 7.0.RC1 runtime 与 Python 调用开销）。
 
 > 注意：1.5 GB OM 在 CANN 7.0.RC1 runtime 上首次加载需要约 75 秒，期间无输出不是卡死。
 
