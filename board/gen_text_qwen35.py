@@ -130,12 +130,15 @@ def generate(model, tok, prompt, max_new=30, temp=0.7, top_k=40):
     prompt_ids = prompt_ids[-n_prompt:]
     print(f"[Prompt: {n_prompt} tokens]\n", flush=True)
 
-    t0 = time.time()
+    t_prefill = time.time()
     for pos, tid in enumerate(prompt_ids):
         model.execute(int(tid), pos)
+    t_prefill = time.time() - t_prefill
+    print(f"  prefill: {t_prefill:.1f}s", flush=True)
 
     current_id = int(prompt_ids[-1])
     n_gen = 0
+    t_decode = time.time()
     for step in range(max_new):
         pos = n_prompt + step
         if pos >= MAX: break
@@ -145,11 +148,12 @@ def generate(model, tok, prompt, max_new=30, temp=0.7, top_k=40):
         current_id = tid; n_gen += 1
         txt = tok.decode([tid], skip_special_tokens=True)
         sys.stdout.write(txt); sys.stdout.flush()
+    t_decode = time.time() - t_decode
 
-    dt = time.time() - t0
-    tok_s = n_gen / dt if dt > 0 else 0
-    ms = dt / n_gen * 1000 if n_gen else 0
-    print(f"\n\n[{n_gen} tok, {dt:.1f}s, {tok_s:.1f} tok/s, {ms:.0f} ms/tok]", flush=True)
+    tok_s = n_gen / t_decode if t_decode > 0 else 0
+    ms = t_decode / n_gen * 1000 if n_gen else 0
+    print(f"\n\n[{n_gen} tok, decode {t_decode:.1f}s, {tok_s:.1f} tok/s, {ms:.0f} ms/tok]"
+          f"  (prefill {t_prefill:.1f}s)", flush=True)
 
 
 def main():
