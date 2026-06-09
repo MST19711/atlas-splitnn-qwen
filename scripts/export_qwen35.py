@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
-"""Qwen3.5-0.8B KV Cache 导出 — exact DeltaNet implementation with conv_state."""
+"""Qwen3.5-0.8B KV Cache ONNX 导出 — 最小 monkey-patch.
+只 patch 三个问题:
+ 1. Attention cat→Where
+ 2. Trilu causal mask → Where+Equal
+ 3. Conv1D 的 copy_ → 非 in-place
+DeltaNet 的 recurrent 计算使用原生 torch 函数."""
 
 import argparse, os, sys
 import torch, torch.nn as nn, torch.nn.functional as F
 import numpy as np
 from transformers import AutoModelForCausalLM
-from transformers.models.qwen3_next.modeling_qwen3_next import apply_rotary_pos_emb
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
-    Qwen3_5GatedDeltaNet, Qwen3_5Attention, Qwen3_5DecoderLayer,
+    Qwen3_5GatedDeltaNet, Qwen3_5Attention, Qwen3_5RMSNorm,
+    apply_rotary_pos_emb,
+    torch_recurrent_gated_delta_rule, torch_chunk_gated_delta_rule,
 )
 
-MAX_LEN = 256; NL = 24; NL_DN = 18; NL_GA = 6
-VOCAB = 248320; K_H = 16; K_DIM = 128; V_DIM = 128
+MAX_LEN = 256; NL_DN = 18; NL_GA = 6
+K_H = 16; K_DIM = 128; V_DIM = 128
 KV_H = 2; HDIM = 256; CONV_D = 6144; CONV_KS = 4
 
 
+# ── Helper: causal mask (Trilu-free) ───────────────────────────────
 def make_attn_mask(max_len, position):
     idx = torch.arange(max_len, dtype=torch.int64)
     m = idx.unsqueeze(0).unsqueeze(0) > position
@@ -22,63 +29,75 @@ def make_attn_mask(max_len, position):
     return bias.masked_fill(~m.unsqueeze(2), 0.0)
 
 
-# ── DeltaNet 单步 ─────────────────────────────────────────────────
-def delta_step(query, key, value, g, beta, S):
-    """seq=1 DeltaNet 状态更新。l2norm + scaling + 迭代状态。"""
-    eps = 1e-6
-    q = query / (query.pow(2).sum(dim=-1,keepdim=True).sqrt() + eps)
-    k = key / (key.pow(2).sum(dim=-1,keepdim=True).sqrt() + eps)
-    q = q * (query.shape[-1] ** -0.5)
-
-    g_t = g.exp().unsqueeze(-1).unsqueeze(-1)
-    beta_t = beta.unsqueeze(-1)
-    S_new = S * g_t
-    kv_mem = (S_new * k.unsqueeze(-1)).sum(dim=-2)
-    delta = (value - kv_mem) * beta_t
-    S_new = S_new + k.unsqueeze(-1) * delta.unsqueeze(-2)
-    out = (S_new * q.unsqueeze(-1)).sum(dim=-2)
-    return out, S_new
+# ── Helper: GQA expand ─────────────────────────────────────────────
+def _repeat_kv(x, n_rep):
+    if n_rep == 1: return x
+    B, H, L, D = x.shape
+    return x[:, :, None, :, :].expand(B, H, n_rep, L, D).reshape(B, H * n_rep, L, D)
 
 
-# ── Patched DeltaNet forward (接受 conv_state) ─────────────────────
+# ── Patch 1: RMSNorm — type_as → to(dtype) ────────────────────────
+_orig_rmsnorm_fwd = Qwen3_5RMSNorm.forward
+def _patched_rmsnorm_fwd(self, x):
+    output = self._norm(x.float()) * (1.0 + self.weight.float())
+    return output.to(x.dtype)
+Qwen3_5RMSNorm.forward = _patched_rmsnorm_fwd
+
+
+# ── Patch 2: Conv state — 原生 torch_causal_conv1d_update 用 copy_,
+#   ONNX 不支持。替换为返回新 state 的版本。 ──────────────────────
+def _safe_conv_update(hidden_states, conv_state, weight, bias, activation):
+    """Same as torch_causal_conv1d_update but returns (out, new_state)."""
+    _, hidden_size, seq_len = hidden_states.shape
+    state_len = conv_state.shape[-1]
+    inp = torch.cat([conv_state, hidden_states], dim=-1).to(weight.dtype)
+    new_state = inp[:, :, -state_len:]
+    out = F.conv1d(inp, weight.unsqueeze(1), bias, padding=0, groups=hidden_size)
+    out = F.silu(out[:, :, -seq_len:])
+    return out.to(hidden_states.dtype), new_state
+
+
+# ── Patch 3: DeltaNet forward — 用原生 recurrent, 只修 conv ──────
 def _patched_dn_fwd(self, hidden_states, attention_mask=None,
-                    past_S=None, past_conv=None, position=None, **kw):
+                    past_S=None, past_conv=None, cache_params=None, **kw):
+    """Thin wrapper: calls native logic but avoids conv state copy_."""
     B, T, _ = hidden_states.shape
     assert T == 1
+
     mqkv = self.in_proj_qkv(hidden_states)
     z = self.in_proj_z(hidden_states)
     b = self.in_proj_b(hidden_states)
     a = self.in_proj_a(hidden_states)
 
-    # CausalConv1D with state
-    mqkv_t = mqkv.transpose(1, 2)           # (1,D,1)
-    ks = self.conv1d.kernel_size[0]
-    cs = past_conv if past_conv is not None else torch.zeros(1, mqkv.shape[-1], ks-1, dtype=mqkv.dtype)
-    inp = torch.cat([cs, mqkv_t], dim=-1)
-    conv = F.conv1d(inp, self.conv1d.weight, self.conv1d.bias, groups=mqkv.shape[-1])
-    mqkv = F.silu(conv).transpose(1, 2)
-    new_conv = inp[:, :, -ks+1:].to(hidden_states.dtype)
+    # Conv with explicit state (avoids copy_ in torch_causal_conv1d_update)
+    mqkv_t = mqkv.transpose(1, 2)
+    cs = past_conv if past_conv is not None else torch.zeros(1, mqkv.shape[-1], self.conv_kernel_size - 1, dtype=mqkv.dtype)
+    mqkv_t, new_conv = _safe_conv_update(mqkv_t, cs, self.conv1d.weight.squeeze(1), self.conv1d.bias, 'silu')
+    mqkv = mqkv_t.transpose(1, 2)
 
     q, k, v = torch.split(mqkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-    q = q.reshape(B, T, -1, self.head_k_dim).transpose(1, 2)
-    k = k.reshape(B, T, -1, self.head_k_dim).transpose(1, 2)
-    v = v.reshape(B, T, -1, self.head_v_dim).transpose(1, 2)
+    q = q.reshape(B, T, -1, self.head_k_dim)
+    k = k.reshape(B, T, -1, self.head_k_dim)
+    v = v.reshape(B, T, -1, self.head_v_dim)
 
-    beta = b.sigmoid().transpose(1, 2)
+    beta = b.sigmoid()
     g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-    g = g.transpose(1, 2)
 
     S = past_S if past_S is not None else torch.zeros(1, self.num_k_heads, self.head_k_dim, self.head_v_dim, dtype=v.dtype)
-    out, S_new = delta_step(q[:,:,0], k[:,:,0], v[:,:,0], g[:,:,0], beta[:,:,0], S)
-    out = out.to(hidden_states.dtype); S_new = S_new.to(hidden_states.dtype)
 
+    # 原生 torch GDN recurrent（与手写 delta_step 数学等价）
+    # 注意: 函数内部会做 transpose(1,2) → 传原始形状 [B,T,H,D] 即可
+    out, S_new = torch_recurrent_gated_delta_rule(
+        q, k, v, g, beta, S, True, use_qk_l2norm_in_kernel=True)
+
+    out = out.to(hidden_states.dtype); S_new = S_new.to(hidden_states.dtype)
     out = self.norm(out.reshape(-1, self.head_v_dim), z[:, 0].reshape(-1, self.head_v_dim))
     out = out.reshape(B, T, -1)
     return self.out_proj(out), S_new, new_conv
 
 
-# ── Attention Cache ───────────────────────────────────────────────
-class _AttentionCacheWrapper:
+# ── Patch 4: Attention (cat→Where) ─────────────────────────────────
+class AttentionCacheWrapper:
     def __init__(self, k_buf, v_buf, position):
         self._k = k_buf; self._v = v_buf; self._pos = position
         self.present_k = k_buf; self.present_v = v_buf
@@ -93,7 +112,42 @@ class _AttentionCacheWrapper:
         return new_k, new_v
 
 
-# ── Wrapper (包含 conv_state) ─────────────────────────────────────
+def _patched_attn_fwd(self, hidden_states, position_embeddings=None,
+                      attention_mask=None, past_key_values=None, **kw):
+    bsz, q_len, _ = hidden_states.size()
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states, gate = torch.chunk(
+        self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
+    gate = gate.reshape(*input_shape, -1)
+    query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+    n_rep = self.num_key_value_groups
+    key_states = _repeat_kv(key_states, n_rep)
+    value_states = _repeat_kv(value_states, n_rep)
+
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = attn_output * torch.sigmoid(gate)
+    attn_output = self.o_proj(attn_output)
+    return attn_output, None
+
+
+# ── Wrapper ─────────────────────────────────────────────────────────
 class Qwen35KVCacheWrapper(nn.Module):
     def __init__(self, text_model, max_len, lm_head):
         super().__init__()
@@ -107,38 +161,35 @@ class Qwen35KVCacheWrapper(nn.Module):
         pos_ids = position.unsqueeze(0)
         pos_emb = self.model.rotary_emb(hidden, pos_ids)
 
-        # Parse: [S0..S17] [conv0..conv17] [K0..K5] [V0..K5]
-        dn_states  = list(cache_flat[:NL_DN])
-        conv_states= list(cache_flat[NL_DN:NL_DN+NL_DN])
-        k_states   = list(cache_flat[NL_DN*2:NL_DN*2+NL_GA])
-        v_states   = list(cache_flat[NL_DN*2+NL_GA:])
+        s_states  = list(cache_flat[:NL_DN])
+        c_states  = list(cache_flat[NL_DN:NL_DN+NL_DN])
+        k_states  = list(cache_flat[NL_DN*2:NL_DN*2+NL_GA])
+        v_states  = list(cache_flat[NL_DN*2+NL_GA:])
 
         pres_S = [None]*NL_DN; pres_C = [None]*NL_DN
         pres_K = [None]*NL_GA; pres_V = [None]*NL_GA
         di, gi = 0, 0
 
-        for i, layer in enumerate(self.model.layers):
+        for layer in self.model.layers:
             res = hidden
             hidden = layer.input_layernorm(hidden)
 
             if layer.layer_type == 'linear_attention':
                 hs, S_new, C_new = layer.linear_attn(
-                    hidden, past_S=dn_states[di], past_conv=conv_states[di], position=position)
-                dn_states[di] = S_new
-                conv_states[di] = C_new
+                    hidden, past_S=s_states[di], past_conv=c_states[di], position=position)
                 pres_S[di] = S_new; pres_C[di] = C_new
                 di += 1
+                hidden = hs
             else:
-                ca = _AttentionCacheWrapper(k_states[gi], v_states[gi], position)
-                hs, _ = layer.self_attn(
+                ca = AttentionCacheWrapper(k_states[gi], v_states[gi], position)
+                hidden, _ = layer.self_attn(
                     hidden, attention_mask=attn_mask,
                     position_embeddings=pos_emb, position_ids=pos_ids,
-                    past_key_values=ca, use_cache=True,
-                )
+                    past_key_values=ca)
                 pres_K[gi] = ca.present_k; pres_V[gi] = ca.present_v
                 gi += 1
 
-            hidden = res + hs
+            hidden = res + hidden
             res = hidden
             hidden = layer.post_attention_layernorm(hidden)
             hidden = layer.mlp(hidden)
@@ -170,9 +221,9 @@ def main():
     print(f"Loaded: {model.config.num_hidden_layers} ly, vocab={model.config.vocab_size}")
 
     Qwen3_5GatedDeltaNet.forward = _patched_dn_fwd
+    Qwen3_5Attention.forward = _patched_attn_fwd
     wrapper = Qwen35KVCacheWrapper(model.model, args.max_len, model.lm_head)
 
-    # I/O names
     inames = ["input_ids", "position"]
     for i in range(NL_DN): inames.append(f"s_past_{i}")
     for i in range(NL_DN): inames.append(f"c_past_{i}")
@@ -187,27 +238,23 @@ def main():
 
     print(f"  I/O: {len(inames)} in, {len(onames)} out")
 
-    # Dummy cache
     cache = []
     for _ in range(NL_DN): cache.append(torch.zeros((1, K_H, K_DIM, V_DIM), dtype=torch.float16))
     for _ in range(NL_DN): cache.append(torch.zeros((1, CONV_D, CONV_KS-1), dtype=torch.float16))
     for _ in range(NL_GA): cache.append(torch.zeros((1, KV_H, N, HDIM), dtype=torch.float16))
     for _ in range(NL_GA): cache.append(torch.zeros((1, KV_H, N, HDIM), dtype=torch.float16))
 
-    # PT forward
     di = torch.ones((1,1), dtype=torch.int64); dp = torch.tensor([0], dtype=torch.int64)
     with torch.no_grad():
         pt = wrapper(di, dp, *cache)
         print(f"PT logits: {pt[0].shape}, [{pt[0].min():.4f},{pt[0].max():.4f}]")
 
-    # Export
     torch.onnx.export(wrapper, (di, dp, *cache), args.output,
                       input_names=inames, output_names=onames,
                       opset_version=15, do_constant_folding=True,
                       dynamo=False, verbose=False)
     print(f"ONNX: {os.path.getsize(args.output)/1024/1024:.1f} MB")
 
-    # ORT
     import onnx, onnxruntime as ort
     onnx.checker.check_model(args.output); print("checker: PASS")
     sess = ort.InferenceSession(args.output, providers=["CPUExecutionProvider"])
