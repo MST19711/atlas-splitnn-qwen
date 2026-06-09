@@ -34,13 +34,13 @@
 
 ## 成果概览
 
-| 方案 | 上下文长度 | 每 token 耗时 | 解码速度* | 输出质量 |
+| 方案 | 上下文长度 | prefill 耗时 | 解码速度 | 输出质量 |
 |------|-----------|-------------|----------|---------|
-| 静态窗口 (seq=32) | 32 token | ~280 ms | 3.6 tok/s | 连贯中文 |
-| Qwen3 KV Cache (max_len=256) | 256 token | ~1200 ms | 0.8 tok/s | 连贯中文 |
-| Qwen3.5 KV Cache (max_len=256) | 256 token | ~7500 ms | 0.1 tok/s | 连贯中文 |
+| 静态窗口 (seq=32) | 32 token | — | 3.6 tok/s | 连贯中文 |
+| Qwen3 KV Cache (max_len=256) | 256 token | ~5.6s (13 tok) | 3.6 tok/s | 连贯中文 |
+| Qwen3.5 KV Cache (max_len=256) | 256 token | ~52s (13 tok) | 3.7 tok/s | 连贯中文 |
 
-> *OM 首次加载约 75 秒（Qwen3 1.5GB）或 195 秒（Qwen3.5 1.9GB）。速度差异主要来自模型大小和 DeltaNet 层计算的额外开销。
+> *解码速度不含 prefill。OM 首次加载约 75 秒（Qwen3 1.5GB）或 195 秒（Qwen3.5 1.9GB）。Qwen3.5 的 DeltaNet 每步需更新 18 个矩阵状态，prefill 耗时远超 Qwen3，但纯 decode 速度相近。
 
 模型输出示例：
 
@@ -287,7 +287,7 @@ K/V 的 D2H + H2D 开销约 10ms，相对 1200ms 的总延迟可以忽略。
 
 输出："你好！有什么可以帮助你的吗？"——与 prompt 匹配的连贯回复。
 
-当前每 token 约 1200ms，解码速度约 0.8 tok/s。模型不区分 prefill 与 decode 阶段，prompt 的 token 同样逐个送入，因此初始 prompt 的处理需要额外时间。
+当前纯解码速度约 3.6 tok/s（275 ms/tok），prefill 约 5.6s（13 token prompt，逐 token 送入）。
 
 ### 性能优化历程
 
@@ -471,10 +471,10 @@ bash scripts/podman_convert.sh
 
 ```
 Prompt: "你好" → "您好！很高兴能与您聊天。我是 Qwen"
-[10 tok, 78.6s, 0.1 tok/s, 7860 ms/tok]
+[prefill 52.3s, decode 5 tok in 1.4s, 3.7 tok/s, 274 ms/tok]
 ```
 
-Qwen3.5 的 DeltaNet 层每步需要更新 18 个 16×128×128 的矩阵状态，计算量远大于 Qwen3 的标准 Attention，因此速度约为 Qwen3 的 1/10。
+Qwen3.5 的纯解码速度与 Qwen3 接近（~3.7 tok/s），但 prefill 耗时远大于 Qwen3（52.3s vs 5.6s）——这是因为 DeltaNet 层每步需要更新 18 个 16×128×128 的稠密矩阵状态，而 Qwen3 的 Attention 只需要写一行稀疏 K/V。
 
 > 首次加载约 195 秒（1.9 GB OM），期间无输出不是卡死。
 

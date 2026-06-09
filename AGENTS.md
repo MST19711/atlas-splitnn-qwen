@@ -59,8 +59,8 @@ podman build --network=host -t localhost/cann-atc-rocky:v7 \
 ## 当前模型
 | 模型 | 文件 | 速度 | 上下文 |
 |------|------|------|--------|
-| Qwen3 KV Cache | om_out/qwen3_kvcache_max256_cann7.om | 0.8 tok/s | 256 tok |
-| Qwen3.5 KV Cache | om_out/qwen3.5_kvcache_max256.om | 0.1 tok/s | 256 tok |
+| Qwen3 KV Cache | om_out/qwen3_kvcache_max256_cann7.om | 3.6 tok/s | 256 tok |
+| Qwen3.5 KV Cache | om_out/qwen3.5_kvcache_max256.om | 3.7 tok/s | 256 tok |
 
 ## 踩坑速查
 1. **ACL API**: `acl.mdl.add_dataset_buffer(ds,buf)` 返回 tuple `(ptr,ret)`, 需 `_, ret = ...`
