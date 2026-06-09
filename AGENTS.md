@@ -47,7 +47,7 @@ bash scripts/podman_convert.sh
 | 模型 | 文件 | 速度 | 上下文 |
 |------|------|------|--------|
 | seq=32 Tile | om_out/qwen3_fp16_seq32_tile.om | 3.6 tok/s | 32 tok |
-| KV Cache | om_out/qwen3_kvcache_max256.om | 0.8 tok/s | 256 tok |
+| KV Cache | om_out/qwen3_kvcache_max256.om | 4.8 tok/s | 256 tok |
 
 ## 踩坑速查
 1. **ACL API**: `acl.mdl.add_dataset_buffer(ds,buf)` 返回 tuple `(ptr,ret)`, 需 `_, ret = ...`
