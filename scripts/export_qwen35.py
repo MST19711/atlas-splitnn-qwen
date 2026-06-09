@@ -24,15 +24,21 @@ def make_attn_mask(max_len, position):
 
 
 # ── DeltaNet 单步 (把 recurrent_gated_delta_rule 展开) ──────────
-def delta_step(query, key, value, g, beta, S):
-    """seq=1 的 DeltaNet 状态更新。全 ONNX 标准算子。"""
+def delta_step(query, key, value, g, beta, S, do_norm=True):
+    """seq=1 的 DeltaNet 状态更新。标准 ONNX 算子 + l2norm。"""
+    eps = 1e-6
+    q = query / (query.pow(2).sum(dim=-1,keepdim=True).sqrt() + eps) if do_norm else query
+    k = key / (key.pow(2).sum(dim=-1,keepdim=True).sqrt() + eps) if do_norm else key
+    scale = (query.shape[-1] ** -0.5)
+    q = q * scale
+
     g_t = g.exp().unsqueeze(-1).unsqueeze(-1)
     beta_t = beta.unsqueeze(-1)
     S_new = S * g_t
-    kv_mem = (S_new * key.unsqueeze(-1)).sum(dim=-2)
+    kv_mem = (S_new * k.unsqueeze(-1)).sum(dim=-2)
     delta = (value - kv_mem) * beta_t
-    S_new = S_new + key.unsqueeze(-1) * delta.unsqueeze(-2)
-    out = (S_new * query.unsqueeze(-1)).sum(dim=-2)
+    S_new = S_new + k.unsqueeze(-1) * delta.unsqueeze(-2)
+    out = (S_new * q.unsqueeze(-1)).sum(dim=-2)
     return out, S_new
 
 
@@ -46,14 +52,14 @@ def _patched_dn_fwd(self, hidden_states, attention_mask=None,
     b = self.in_proj_b(hidden_states)
     a = self.in_proj_a(hidden_states)
 
-    # Conv1d
-    mqkv_t = mqkv.transpose(1, 2)
+    # CausalConv1D (支持批量)
+    mqkv_t = mqkv.transpose(1, 2)           # (1,D,1)
     ks = self.conv1d.kernel_size[0]
-    cs = torch.zeros(1, mqkv.shape[-1], ks-1, dtype=mqkv.dtype)
+    cs = past_conv if 'past_conv' in locals() and past_conv is not None else torch.zeros(1, mqkv.shape[-1], ks-1, dtype=mqkv.dtype)
     inp = torch.cat([cs, mqkv_t], dim=-1)
     conv = F.conv1d(inp, self.conv1d.weight, self.conv1d.bias, groups=mqkv.shape[-1])
-    mqkv_c = F.silu(conv)
-    mqkv = mqkv_c.transpose(1, 2)
+    mqkv = F.silu(conv).transpose(1, 2)     # (1,1,D)
+    new_conv = inp[:, :, -ks+1:]
 
     q, k, v = torch.split(mqkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
     q = q.reshape(B, T, -1, self.head_k_dim).transpose(1, 2)
@@ -70,7 +76,7 @@ def _patched_dn_fwd(self, hidden_states, attention_mask=None,
 
     out = self.norm(out.reshape(-1, self.head_v_dim), z[:, 0].reshape(-1, self.head_v_dim))
     out = out.reshape(B, T, -1)
-    return self.out_proj(out), S_new
+    return self.out_proj(out), S_new, new_conv
 
 
 # ── 第2步：Cache 对象 (接管 K/V + DeltaNet S) ─────────────────
@@ -126,7 +132,9 @@ class Qwen35KVCacheWrapper(nn.Module):
         k_states  = list(cache_flat[NL_DN:NL_DN+NL_GA])
         v_states  = list(cache_flat[NL_DN+NL_GA:])
 
-        presents = []
+        presents_S = [None]*NL_DN
+        presents_K = [None]*NL_GA
+        presents_V = [None]*NL_GA
         di, gi = 0, 0
         for i, layer in enumerate(self.model.layers):
             # Pre-norm
@@ -134,9 +142,9 @@ class Qwen35KVCacheWrapper(nn.Module):
             hidden = layer.input_layernorm(hidden)
 
             if layer.layer_type == 'linear_attention':
-                hs, S_new = layer.linear_attn(hidden, past_S=dn_states[di], position=position)
+                hs, S_new, _ = layer.linear_attn(hidden, past_S=dn_states[di], position=position)
                 dn_states[di] = S_new
-                presents.append(S_new)
+                presents_S[di] = S_new
                 di += 1
             else:
                 ca = _AttentionCacheWrapper(k_states[gi], v_states[gi], position)
@@ -149,8 +157,8 @@ class Qwen35KVCacheWrapper(nn.Module):
                     use_cache=True,
                 )
                 k_states[gi] = ca.present_k; v_states[gi] = ca.present_v
-                presents.append(ca.present_k)
-                presents.append(ca.present_v)
+                presents_K[gi] = ca.present_k
+                presents_V[gi] = ca.present_v
                 gi += 1
 
             hidden = res + hs
@@ -163,7 +171,7 @@ class Qwen35KVCacheWrapper(nn.Module):
 
         hidden = self.model.norm(hidden)
         logits = self.lm_head(hidden)
-        return (logits, *presents)
+        return (logits, *presents_S, *presents_K, *presents_V)
 
 
 # ── 导出 ───────────────────────────────────────────────────────────
