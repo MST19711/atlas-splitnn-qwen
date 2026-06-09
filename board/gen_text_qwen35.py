@@ -11,12 +11,13 @@ import acl
 from transformers import AutoTokenizer
 
 M, H2D, D2H = 0, 1, 2
-MAX = 256; NL_DN = 18; NL_GA = 6
+NL_DN = 18; NL_GA = 6
 K_H = 16; K_DIM = 128; V_DIM = 128; CONV_D = 6144; CONV_KS = 4
 KV_H = 2; HDIM = 256
 S_BYTES = 1 * K_H * K_DIM * V_DIM * 2
 C_BYTES = 1 * CONV_D * (CONV_KS - 1) * 2
-KV_BYTES = 1 * KV_H * MAX * HDIM * 2
+
+# KV_BYTES and MAX are set dynamically from --max-len
 
 
 def check(r, m):
@@ -24,19 +25,19 @@ def check(r, m):
 
 
 def _make_ds(dev_ids, dev_pos, s_src, c_src, k_src, v_src,
-             dev_logits, s_dst, c_dst, k_dst, v_dst, tag):
+             dev_logits, s_dst, c_dst, k_dst, v_dst, kv_bytes, tag):
     ds_in = acl.mdl.create_dataset(); ds_out = acl.mdl.create_dataset()
     bufs_in, bufs_out = [], []
     for ptr, sz in [(dev_ids, 8), (dev_pos, 8)]:
         b = acl.create_data_buffer(ptr, sz); bufs_in.append(b)
         _, ret = acl.mdl.add_dataset_buffer(ds_in, b); check(ret, f"{tag} add_in")
-    for ptrs, sz in [(s_src, S_BYTES), (c_src, C_BYTES), (k_src, KV_BYTES), (v_src, KV_BYTES)]:
+    for ptrs, sz in [(s_src, S_BYTES), (c_src, C_BYTES), (k_src, kv_bytes), (v_src, kv_bytes)]:
         for p in ptrs:
             b = acl.create_data_buffer(p, sz); bufs_in.append(b)
             _, ret = acl.mdl.add_dataset_buffer(ds_in, b); check(ret, f"{tag} add_in")
     b = acl.create_data_buffer(dev_logits, 496640); bufs_out.append(b)
     _, ret = acl.mdl.add_dataset_buffer(ds_out, b); check(ret, f"{tag} add_out_logits")
-    for ptrs, sz in [(s_dst, S_BYTES), (c_dst, C_BYTES), (k_dst, KV_BYTES), (v_dst, KV_BYTES)]:
+    for ptrs, sz in [(s_dst, S_BYTES), (c_dst, C_BYTES), (k_dst, kv_bytes), (v_dst, kv_bytes)]:
         for p in ptrs:
             b = acl.create_data_buffer(p, sz); bufs_out.append(b)
             _, ret = acl.mdl.add_dataset_buffer(ds_out, b); check(ret, f"{tag} add_out")
@@ -44,7 +45,8 @@ def _make_ds(dev_ids, dev_pos, s_src, c_src, k_src, v_src,
 
 
 class ACLModel:
-    def __init__(self, path):
+    def __init__(self, path, max_len):
+        kv_bytes = 1 * KV_H * max_len * HDIM * 2
         print("[init] Loading model...", flush=True)
         check(acl.init(), "init")
         check(acl.rt.set_device(0), "set_device")
@@ -70,8 +72,8 @@ class ACLModel:
             return (
                 [_alloc_ptr(S_BYTES) for _ in range(NL_DN)],
                 [_alloc_ptr(C_BYTES) for _ in range(NL_DN)],
-                [_alloc_ptr(KV_BYTES) for _ in range(NL_GA)],
-                [_alloc_ptr(KV_BYTES) for _ in range(NL_GA)],
+                [_alloc_ptr(kv_bytes) for _ in range(NL_GA)],
+                [_alloc_ptr(kv_bytes) for _ in range(NL_GA)],
             )
         self._sA, self._cA, self._kA, self._vA = _alloc_set()
         self._sB, self._cB, self._kB, self._vB = _alloc_set()
@@ -80,11 +82,11 @@ class ACLModel:
         print("[init] Creating datasets AB...", flush=True)
         self._ds_in_A, self._ds_out_B, _, _ = _make_ds(
             self._di, self._dp, self._sA, self._cA, self._kA, self._vA,
-            self._dl, self._sB, self._cB, self._kB, self._vB, "AB")
+            self._dl, self._sB, self._cB, self._kB, self._vB, kv_bytes, "AB")
         print("[init] Creating datasets BA...", flush=True)
         self._ds_in_B, self._ds_out_A, _, _ = _make_ds(
             self._di, self._dp, self._sB, self._cB, self._kB, self._vB,
-            self._dl, self._sA, self._cA, self._kA, self._vA, "BA")
+            self._dl, self._sA, self._cA, self._kA, self._vA, kv_bytes, "BA")
         print("[init] Done.", flush=True)
 
         self._hi = np.empty(8, np.uint8); self._hp = np.empty(8, np.uint8)
@@ -124,9 +126,9 @@ def sample(logits, temp=0.7, top_k=40):
     return int(np.random.choice(len(p), p=p))
 
 
-def generate(model, tok, prompt, max_new=30, temp=0.7, top_k=40):
+def generate(model, tok, prompt, max_new=30, temp=0.7, top_k=40, max_len=256):
     prompt_ids = tok.encode(prompt, add_special_tokens=False)
-    n_prompt = min(len(prompt_ids), MAX)
+    n_prompt = min(len(prompt_ids), max_len)
     prompt_ids = prompt_ids[-n_prompt:]
     print(f"[Prompt: {n_prompt} tokens]\n", flush=True)
 
@@ -140,7 +142,7 @@ def generate(model, tok, prompt, max_new=30, temp=0.7, top_k=40):
     t_decode = time.time()
     for step in range(max_new):
         pos = n_prompt + step
-        if pos >= MAX: break
+        if pos >= max_len: break
         logits = model.execute(current_id, pos)
         tid = sample(logits, temp, top_k)
         if tid == tok.eos_token_id: break
@@ -162,6 +164,7 @@ def main():
     p.add_argument("--max-tokens", type=int, default=30)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top-k", type=int, default=40)
+    p.add_argument("--max-len", type=int, default=256, help="Max context length")
     args = p.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer_dir, trust_remote_code=True)
@@ -171,11 +174,11 @@ def main():
 
     print(f"Model: {args.model}", flush=True)
     t_load = time.time()
-    model = ACLModel(args.model)
+    model = ACLModel(args.model, args.max_len)
     t_load = time.time() - t_load
     print(f"Model loaded in {t_load:.1f}s", flush=True)
     try:
-        generate(model, tok, formatted, args.max_tokens, args.temperature, args.top_k)
+        generate(model, tok, formatted, args.max_tokens, args.temperature, args.top_k, args.max_len)
     finally:
         model.close()
         print("Done.", flush=True)
