@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""Qwen3.5-0.8B KV Cache 导出 — 自定义 Cache 对象 + DeltaNet 迭代化"""
+"""Qwen3.5-0.8B KV Cache 导出 — exact DeltaNet implementation with conv_state."""
 
 import argparse, os, sys
 import torch, torch.nn as nn, torch.nn.functional as F
 import numpy as np
 from transformers import AutoModelForCausalLM
 from transformers.models.qwen3_next.modeling_qwen3_next import apply_rotary_pos_emb
-from transformers.models.qwen3.modeling_qwen3 import eager_attention_forward
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5GatedDeltaNet, Qwen3_5Attention, Qwen3_5DecoderLayer,
 )
 
 MAX_LEN = 256; NL = 24; NL_DN = 18; NL_GA = 6
 VOCAB = 248320; K_H = 16; K_DIM = 128; V_DIM = 128
-Q_H = 16; KV_H = 2; HDIM = 256
+KV_H = 2; HDIM = 256; CONV_D = 6144; CONV_KS = 4
 
 
 def make_attn_mask(max_len, position):
@@ -23,14 +22,13 @@ def make_attn_mask(max_len, position):
     return bias.masked_fill(~m.unsqueeze(2), 0.0)
 
 
-# ── DeltaNet 单步 (把 recurrent_gated_delta_rule 展开) ──────────
-def delta_step(query, key, value, g, beta, S, do_norm=True):
-    """seq=1 的 DeltaNet 状态更新。标准 ONNX 算子 + l2norm。"""
+# ── DeltaNet 单步 ─────────────────────────────────────────────────
+def delta_step(query, key, value, g, beta, S):
+    """seq=1 DeltaNet 状态更新。l2norm + scaling + 迭代状态。"""
     eps = 1e-6
-    q = query / (query.pow(2).sum(dim=-1,keepdim=True).sqrt() + eps) if do_norm else query
-    k = key / (key.pow(2).sum(dim=-1,keepdim=True).sqrt() + eps) if do_norm else key
-    scale = (query.shape[-1] ** -0.5)
-    q = q * scale
+    q = query / (query.pow(2).sum(dim=-1,keepdim=True).sqrt() + eps)
+    k = key / (key.pow(2).sum(dim=-1,keepdim=True).sqrt() + eps)
+    q = q * (query.shape[-1] ** -0.5)
 
     g_t = g.exp().unsqueeze(-1).unsqueeze(-1)
     beta_t = beta.unsqueeze(-1)
@@ -42,9 +40,9 @@ def delta_step(query, key, value, g, beta, S, do_norm=True):
     return out, S_new
 
 
-# ── 第1步：Patched DeltaNet forward ────────────────────────────────
+# ── Patched DeltaNet forward (接受 conv_state) ─────────────────────
 def _patched_dn_fwd(self, hidden_states, attention_mask=None,
-                    past_S=None, position=None, **kw):
+                    past_S=None, past_conv=None, position=None, **kw):
     B, T, _ = hidden_states.shape
     assert T == 1
     mqkv = self.in_proj_qkv(hidden_states)
@@ -52,14 +50,14 @@ def _patched_dn_fwd(self, hidden_states, attention_mask=None,
     b = self.in_proj_b(hidden_states)
     a = self.in_proj_a(hidden_states)
 
-    # CausalConv1D (支持批量)
+    # CausalConv1D with state
     mqkv_t = mqkv.transpose(1, 2)           # (1,D,1)
     ks = self.conv1d.kernel_size[0]
-    cs = past_conv if 'past_conv' in locals() and past_conv is not None else torch.zeros(1, mqkv.shape[-1], ks-1, dtype=mqkv.dtype)
+    cs = past_conv if past_conv is not None else torch.zeros(1, mqkv.shape[-1], ks-1, dtype=mqkv.dtype)
     inp = torch.cat([cs, mqkv_t], dim=-1)
     conv = F.conv1d(inp, self.conv1d.weight, self.conv1d.bias, groups=mqkv.shape[-1])
-    mqkv = F.silu(conv).transpose(1, 2)     # (1,1,D)
-    new_conv = inp[:, :, -ks+1:]
+    mqkv = F.silu(conv).transpose(1, 2)
+    new_conv = inp[:, :, -ks+1:].to(hidden_states.dtype)
 
     q, k, v = torch.split(mqkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
     q = q.reshape(B, T, -1, self.head_k_dim).transpose(1, 2)
@@ -79,26 +77,8 @@ def _patched_dn_fwd(self, hidden_states, attention_mask=None,
     return self.out_proj(out), S_new, new_conv
 
 
-# ── 第2步：Cache 对象 (接管 K/V + DeltaNet S) ─────────────────
-class HybridCache:
-    """混合 cache: DeltaNet → S, Attention → K,V。所有 buffer 固定大小。"""
-    def __init__(self, n_k, n_v, k_h, v_h, kv_dim, hdim, max_len):
-        self.S = [torch.zeros(1, k_h, k_dim, v_dim, dtype=torch.float16) for _ in range(n_k)]
-        self.K = [torch.zeros(1, kv_dim, max_len, hdim, dtype=torch.float16) for _ in range(n_v)]
-        self.V = [torch.zeros(1, kv_dim, max_len, hdim, dtype=torch.float16) for _ in range(n_v)]
-        self._pos = 0
-
-    def set_position(self, p):
-        self._pos = p
-
-    # 给 attention 用的接口：期望 past_key_value.update(key, value, layer_idx)
-    def get_attention_cache(self, idx):
-        """返回一个 cache 对象，供 Qwen3NextAttention.forward() 使用"""
-        return _AttentionCacheWrapper(self.K[idx], self.V[idx], self._pos)
-
-
+# ── Attention Cache ───────────────────────────────────────────────
 class _AttentionCacheWrapper:
-    """模仿 Cache 接口，insert_to_cache + Where。更新结果存在 self.present_k/v"""
     def __init__(self, k_buf, v_buf, position):
         self._k = k_buf; self._v = v_buf; self._pos = position
         self.present_k = k_buf; self.present_v = v_buf
@@ -113,7 +93,7 @@ class _AttentionCacheWrapper:
         return new_k, new_v
 
 
-# ── 第3步：Wrapper ──────────────────────────────────────────────────────
+# ── Wrapper (包含 conv_state) ─────────────────────────────────────
 class Qwen35KVCacheWrapper(nn.Module):
     def __init__(self, text_model, max_len, lm_head):
         super().__init__()
@@ -127,43 +107,38 @@ class Qwen35KVCacheWrapper(nn.Module):
         pos_ids = position.unsqueeze(0)
         pos_emb = self.model.rotary_emb(hidden, pos_ids)
 
-        # Parse cache_flat into DeltaNet S + K, V
-        dn_states = list(cache_flat[:NL_DN])
-        k_states  = list(cache_flat[NL_DN:NL_DN+NL_GA])
-        v_states  = list(cache_flat[NL_DN+NL_GA:])
+        # Parse: [S0..S17] [conv0..conv17] [K0..K5] [V0..K5]
+        dn_states  = list(cache_flat[:NL_DN])
+        conv_states= list(cache_flat[NL_DN:NL_DN+NL_DN])
+        k_states   = list(cache_flat[NL_DN*2:NL_DN*2+NL_GA])
+        v_states   = list(cache_flat[NL_DN*2+NL_GA:])
 
-        presents_S = [None]*NL_DN
-        presents_K = [None]*NL_GA
-        presents_V = [None]*NL_GA
+        pres_S = [None]*NL_DN; pres_C = [None]*NL_DN
+        pres_K = [None]*NL_GA; pres_V = [None]*NL_GA
         di, gi = 0, 0
+
         for i, layer in enumerate(self.model.layers):
-            # Pre-norm
             res = hidden
             hidden = layer.input_layernorm(hidden)
 
             if layer.layer_type == 'linear_attention':
-                hs, S_new, _ = layer.linear_attn(hidden, past_S=dn_states[di], position=position)
+                hs, S_new, C_new = layer.linear_attn(
+                    hidden, past_S=dn_states[di], past_conv=conv_states[di], position=position)
                 dn_states[di] = S_new
-                presents_S[di] = S_new
+                conv_states[di] = C_new
+                pres_S[di] = S_new; pres_C[di] = C_new
                 di += 1
             else:
                 ca = _AttentionCacheWrapper(k_states[gi], v_states[gi], position)
                 hs, _ = layer.self_attn(
-                    hidden,
-                    attention_mask=attn_mask,
-                    position_embeddings=pos_emb,
-                    position_ids=pos_ids,
-                    past_key_values=ca,
-                    use_cache=True,
+                    hidden, attention_mask=attn_mask,
+                    position_embeddings=pos_emb, position_ids=pos_ids,
+                    past_key_values=ca, use_cache=True,
                 )
-                k_states[gi] = ca.present_k; v_states[gi] = ca.present_v
-                presents_K[gi] = ca.present_k
-                presents_V[gi] = ca.present_v
+                pres_K[gi] = ca.present_k; pres_V[gi] = ca.present_v
                 gi += 1
 
             hidden = res + hs
-
-            # Post-norm + MLP
             res = hidden
             hidden = layer.post_attention_layernorm(hidden)
             hidden = layer.mlp(hidden)
@@ -171,7 +146,7 @@ class Qwen35KVCacheWrapper(nn.Module):
 
         hidden = self.model.norm(hidden)
         logits = self.lm_head(hidden)
-        return (logits, *presents_S, *presents_K, *presents_V)
+        return (logits, *pres_S, *pres_C, *pres_K, *pres_V)
 
 
 # ── 导出 ───────────────────────────────────────────────────────────
@@ -181,8 +156,8 @@ def main():
     p.add_argument("--output", default="om_out/qwen3.5_kvcache_max256.onnx")
     p.add_argument("--max-len", type=int, default=256)
     args = p.parse_args()
-
     N = args.max_len
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path, torch_dtype=torch.float16,
         device_map="cpu", trust_remote_code=True,
@@ -192,29 +167,34 @@ def main():
     for layer in model.model.layers:
         if hasattr(layer, 'self_attn'):
             layer.self_attn.config._attn_implementation = "eager"
-    print(f"Loaded: {model.config.num_hidden_layers} layers, vocab={model.config.vocab_size}")
+    print(f"Loaded: {model.config.num_hidden_layers} ly, vocab={model.config.vocab_size}")
 
-    # Patch DeltaNet only
     Qwen3_5GatedDeltaNet.forward = _patched_dn_fwd
-
     wrapper = Qwen35KVCacheWrapper(model.model, args.max_len, model.lm_head)
 
+    # I/O names
     inames = ["input_ids", "position"]
     for i in range(NL_DN): inames.append(f"s_past_{i}")
+    for i in range(NL_DN): inames.append(f"c_past_{i}")
     for i in range(NL_GA): inames.append(f"k_past_{i}")
     for i in range(NL_GA): inames.append(f"v_past_{i}")
 
     onames = ["logits"]
     for i in range(NL_DN): onames.append(f"s_pres_{i}")
+    for i in range(NL_DN): onames.append(f"c_pres_{i}")
     for i in range(NL_GA): onames.append(f"k_pres_{i}")
     for i in range(NL_GA): onames.append(f"v_pres_{i}")
 
+    print(f"  I/O: {len(inames)} in, {len(onames)} out")
+
+    # Dummy cache
     cache = []
     for _ in range(NL_DN): cache.append(torch.zeros((1, K_H, K_DIM, V_DIM), dtype=torch.float16))
+    for _ in range(NL_DN): cache.append(torch.zeros((1, CONV_D, CONV_KS-1), dtype=torch.float16))
     for _ in range(NL_GA): cache.append(torch.zeros((1, KV_H, N, HDIM), dtype=torch.float16))
     for _ in range(NL_GA): cache.append(torch.zeros((1, KV_H, N, HDIM), dtype=torch.float16))
 
-    # PyTorch forward
+    # PT forward
     di = torch.ones((1,1), dtype=torch.int64); dp = torch.tensor([0], dtype=torch.int64)
     with torch.no_grad():
         pt = wrapper(di, dp, *cache)
@@ -233,6 +213,7 @@ def main():
     sess = ort.InferenceSession(args.output, providers=["CPUExecutionProvider"])
     feed = {"input_ids": np.ones((1,1),np.int64), "position": np.array([0],np.int64)}
     for i in range(NL_DN): feed[f"s_past_{i}"] = np.zeros((1,K_H,K_DIM,V_DIM),np.float16)
+    for i in range(NL_DN): feed[f"c_past_{i}"] = np.zeros((1,CONV_D,CONV_KS-1),np.float16)
     for i in range(NL_GA): feed[f"k_past_{i}"] = feed[f"v_past_{i}"] = np.zeros((1,KV_H,N,HDIM),np.float16)
     ort_out = sess.run(None, feed)
     d = np.abs(pt[0].numpy().astype(np.float16) - ort_out[0]).max()
