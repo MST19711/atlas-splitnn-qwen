@@ -20,7 +20,7 @@
 scripts/        # ONNX 导出 + ATC 转换 (x86 dev)
   export_fp16.py        seq=N 静态导出
   export_kvcache.py     KV Cache 导出 (monkey-patch Qwen3Attention)
-  export_qwen35.py      Qwen3.5 KV Cache 导出 (DeltaNet monkey-patch)
+  export_qwen35.py      Qwen3.5 KV Cache 导出 (4 个轻量 patch: cat→Where, Trilu, RMSNorm, conv)
   patch_onnx.py         GQA Expand→Tile
   podman_convert.sh
 board/          # 板载推理 (aarch64)
@@ -60,7 +60,7 @@ podman build --network=host -t localhost/cann-atc-rocky:v7 \
 | 模型 | 文件 | 速度 | 上下文 |
 |------|------|------|--------|
 | Qwen3 KV Cache | om_out/qwen3_kvcache_max256_cann7.om | 0.8 tok/s | 256 tok |
-| Qwen3.5 KV Cache | om_out/qwen3.5_kvcache_max256_cann7.om | 0.1 tok/s | 256 tok |
+| Qwen3.5 KV Cache | om_out/qwen3.5_kvcache_max256.om | 0.1 tok/s | 256 tok |
 
 ## 踩坑速查
 1. **ACL API**: `acl.mdl.add_dataset_buffer(ds,buf)` 返回 tuple `(ptr,ret)`, 需 `_, ret = ...`
