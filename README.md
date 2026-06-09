@@ -36,11 +36,10 @@
 | 方案 | 上下文长度 | 每 token 耗时 | 解码速度* | 输出质量 |
 |------|-----------|-------------|----------|---------|
 | 静态窗口 (seq=32) | 32 token | ~280 ms | 3.6 tok/s | 连贯中文 |
-| KV Cache (max_len=256) | 256 token | ~420 ms | 2.4 tok/s | 连贯中文 |
+| KV Cache (max_len=256) | 256 token | ~210 ms | 4.8 tok/s | 连贯中文 |
 
-> *解码速度 = 纯生成阶段速度，不含 prompt 处理。KV Cache 方案无独立 prefill 阶段，
-> prompt 的每一 token 也逐步送入模型，因此实际"用户感知速度"包括 prompt 处理耗时（约 0.8 tok/s
-> 含 prompt 处理）。表格中列出的是纯解码速度。
+> *解码速度 = 纯生成阶段速度（不含 prompt）。OM 首次加载约 75 秒，后续每 token 约 210ms，达到当前
+> NPU 计算 174ms 的理论下限附近（剩余 ~36ms 为 H2D/D2H/Python 采样开销）。
 
 模型输出示例：
 
@@ -246,21 +245,52 @@ K/V 的 D2H + H2D 开销约 10ms，相对 1200ms 的总延迟可以忽略。
 
 输出："你好！有什么可以帮助你的吗？"——与 prompt 匹配的连贯回复。
 
-每 token 约 420ms（解码阶段）。模型不区分 prefill 与 decode 阶段，prompt 的 token 同样逐个送入，因此初始 prompt 的处理需要额外时间（13 token 的 prompt 约 5.5s 后开始产出文字）。纯解码速度约 2.4 tok/s。
+当前每 token 约 210ms，纯解码速度约 4.8 tok/s。模型不区分 prefill 与 decode 阶段，prompt 的 token 同样逐个送入，因此初始 prompt 的处理需要额外时间。
 
-Profiler 实测每步耗时分解：
+### 性能优化历程
 
-| 类别 | 耗时 | 占比 | 说明 |
-|------|------|------|------|
-| BatchMatMulV2 (NPU 计算) | 174ms | 41% | 矩阵乘法（Q/K/V 投影、MLP、注意力），由 msprof 实测 |
-| Host 侧 alloc + memcpy | ~200ms | 48% | 每步 115 次 malloc + 112 次 memcpy（K/V 在 host↔device 间搬运） |
-| Python / ACL 框架 | ~46ms | 11% | 数据集创建/销毁等框架开销 |
+开发板推理经历了三轮优化：
 
-> 数据来源：`msprof --ascendcl=on --task-time=on --ai-core=on` 在开发板上实测。
-> 最大优化方向：消除每步的 alloc/memcpy，将 K/V 固化在 device 内存中。
-> 理论上限：174ms/step → 5.7 tok/s。
+**初始版本**（每步 alloc + memcpy，ACL 框架开销严重）：
 
-瓶颈在**Host 侧的频繁 alloc/memcpy**（每步 115 次分配 + 112 次数据搬运，占 ~48% 耗时），而非 NPU 计算本身。将 K/V 固化在 device 内存中可消除此开销，理论上限 5.7 tok/s。
+```
+每步 execute():
+  acl.rt.malloc × 115      ← 为 58 个输入 + 57 个输出分配 buffer
+  acl.rt.memcpy × 112      ← K/V 在 host↔device 间全量搬运（28MB）
+  acl.mdl.execute()         ← 174ms NPU 计算
+  acl.rt.free × 115         ← 释放
+
+每步约 420ms，Profiler 实测：
+- NPU 计算 (BatchMatMulV2): 174ms
+- Host alloc + memcpy: ~200ms
+- Framework 开销: ~46ms
+```
+
+Profiler 数据（`msprof --ascendcl=on --task-time=on --ai-core=on`）：
+
+| 类别 | 耗时 | 占比 |
+|------|------|------|
+| BatchMatMulV2 (NPU 计算) | 174ms | 41% |
+| Host 侧 alloc + memcpy | ~200ms | 48% |
+| Python / ACL 框架 | ~46ms | 11% |
+
+**第一轮优化**：预分配 device 缓冲区 + K/V 指针轮转（双缓冲），消除每步的 `acl.rt.malloc`/`acl.rt.free` 和 112 次 K/V memcpy。
+
+```
+每步只剩: H2D(16B) + execute + D2H(303KB)
+K/V 留在 device 内存，指针身份互换
+```
+
+**第二轮优化**：预创建 AB/BA 两组 dataset 并绑定到双缓冲 K/V，消除每步的 `acl.mdl.create_dataset`/`destroy_dataset`/`create_data_buffer`/`add_dataset_buffer`。
+
+```
+每步只剩: H2D(16B) + execute + D2H(303KB)
+（全部数据结构在模型生命周期内一次性创建）
+```
+
+最终每步约 210ms。因为 NPU 计算 174ms 是理论下限，剩余的 ~36ms 是 H2D/D2H/Python 采样的固定开销。
+
+> 注意：1.5 GB OM 在 CANN 7.0.RC1 runtime 上首次加载需要约 75 秒，期间无输出不是卡死。
 
 ---
 
@@ -445,23 +475,78 @@ sshpass -p 'Mind@123' scp om_out/qwen3_kvcache_max256.om \
 ```
 
 
-### 准备开发板环境
-（网络配置方法和CANN 8.0运行时安装方法详见官方文档）
+### 准备开发板环境（离线恢复）
+
+如果开发板刚重置、没有公网连接，只要板上出厂 Ascend runtime/pyACL 还在，就可以按下面流程离线恢复到可运行 KV Cache 模型的状态。
+本项目实测的重置后环境是：Ubuntu 22.04 aarch64、Python 3.10.6、`npu-smi 23.0.rc3`、CANN Toolkit `7.0.RC1`。
+虽然 OM 是用 CANN 8.0.RC3 编译的，但这个 `qwen3_kvcache_max256.om` 在该 CANN 7.0.RC1 runtime 上可以成功加载并执行；这只说明当前模型兼容，不代表所有 CANN 8 产物都能在 CANN 7 上运行。
+
+#### 1. 板端基础检查
+
+在**开发机**上执行：
+
 ```bash
-# 1. SSH 登录
-ssh root@192.168.137.100   # 密码 Mind@123
-
-# 2. 安装 Python 依赖（板子上已有 CANN 8.0 运行时，只需补这些）
-pip3 install torch --extra-index-url https://download.pytorch.org/whl/cpu
-pip3 install transformers
-
-# 3. 创建部署目录
-mkdir -p /root/slm_deploy
-
-# 4. 验证环境
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-python3 -c "import acl, transformers, numpy; print('OK')"
+sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no \
+    root@192.168.137.100 '
+python3 --version
 npu-smi info
+find /usr/local/Ascend -maxdepth 5 -name set_env.sh -print
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+python3 -c "import acl; print(\"acl OK\")"
+'
+```
+
+期望结果：
+
+- `npu-smi info` 能看到 `310B4`
+- `source /usr/local/Ascend/ascend-toolkit/set_env.sh` 后 `import acl` 成功
+- 如果 `import acl` 失败，先修复或重装 Ascend runtime/Toolkit；Python 依赖无法替代 pyACL
+
+#### 2. 准备 aarch64 离线 Python wheel
+
+如果开发机已有 `tmp/*.whl` 和 `tmp/get-pip.py`，可直接使用。没有的话，在**有网络的开发机**上下载到 `tmp/`：
+
+```bash
+mkdir -p tmp
+python3 -m pip download --dest tmp --platform manylinux2014_aarch64 \
+    --python-version 310 --implementation cp --abi cp310 \
+    --only-binary=:all: \
+    "numpy==1.26.4" "transformers==4.53.3" \
+    "tokenizers==0.21.4" "torch==2.1.0" \
+    "safetensors" "huggingface-hub" "requests" "pyyaml" \
+    "regex" "tqdm" "filelock" "fsspec" "packaging" \
+    "typing-extensions" "sympy" "networkx" "jinja2"
+curl -L https://bootstrap.pypa.io/get-pip.py -o tmp/get-pip.py
+python3 -m pip download --dest tmp pip setuptools wheel
+```
+
+说明：
+
+- 固定 `numpy==1.26.4`，避免 NumPy 2.x 和旧版 CANN/pyACL 组合出现兼容风险
+- `torch` 在板端只用于 tokenizer/transformers 依赖链，不参与 NPU 推理
+- 如果 `torch==2.1.0` 下载不到 aarch64 wheel，可换用本地已验证的 `torch-2.1.0-cp310-cp310-manylinux2014_aarch64.whl`
+
+#### 3. 传输离线依赖并安装
+
+在**开发机**上执行：
+
+```bash
+sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no \
+    root@192.168.137.100 'mkdir -p /root/slm_deploy/wheels'
+
+sshpass -p 'Mind@123' scp tmp/*.whl tmp/get-pip.py \
+    root@192.168.137.100:/root/slm_deploy/wheels/
+
+sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no \
+    root@192.168.137.100 '
+cd /root/slm_deploy
+python3 wheels/get-pip.py --no-index --find-links=/root/slm_deploy/wheels \
+    pip setuptools wheel
+python3 -m pip install --no-index --find-links=/root/slm_deploy/wheels \
+    --force-reinstall "numpy==1.26.4" transformers torch
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+python3 -c "import acl, numpy, transformers, torch; print(numpy.__version__, transformers.__version__, torch.__version__)"
+'
 ```
 
 ### 传输文件到开发板
@@ -475,19 +560,33 @@ sshpass -p 'Mind@123' scp \
     model/Qwen3-0.6B/tokenizer_config.json \
     model/Qwen3-0.6B/vocab.json \
     model/Qwen3-0.6B/merges.txt \
+    model/Qwen3-0.6B/config.json \
+    model/Qwen3-0.6B/generation_config.json \
     root@192.168.137.100:/root/slm_deploy/
 
 # 推理脚本
 sshpass -p 'Mind@123' scp \
     board/gen_text_seq32.py \
     board/gen_text_kvcache.py \
+    board/run_kvcache.sh \
     root@192.168.137.100:/root/slm_deploy/
+sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no \
+    root@192.168.137.100 'chmod +x /root/slm_deploy/run_kvcache.sh'
 
 # OM 模型文件（先确保已完成 ATC 转换，文件在 om_out/ 下）
 sshpass -p 'Mind@123' scp om_out/qwen3_fp16_seq32_tile.om \
     root@192.168.137.100:/root/slm_deploy/
 sshpass -p 'Mind@123' scp om_out/qwen3_kvcache_max256.om \
-    root@192.168.137.100:/root/slm_deploy/
+    root@192.168.137.100:/root/slm_deploy/qwen3_kvcache_max256_b4.om
+```
+
+可选：校验大文件传输是否完整。
+
+```bash
+sha256sum om_out/qwen3_kvcache_max256.om
+sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no \
+    root@192.168.137.100 \
+    'sha256sum /root/slm_deploy/qwen3_kvcache_max256_b4.om'
 ```
 
 ### 运行推理
@@ -503,7 +602,33 @@ python3 gen_text_seq32.py --prompt "你好，请介绍一下你自己" --max-tok
 
 # KV Cache 模型 (max_len=256)
 python3 gen_text_kvcache.py --prompt "你好，请介绍一下你自己" --max-tokens 50
+
+# 或使用封装好的入口
+./run_kvcache.sh --prompt "你好，请介绍一下你自己" --max-tokens 50
 ```
+
+首次运行前可做一个短冒烟测试：
+
+```bash
+sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no \
+    root@192.168.137.100 '
+cd /root/slm_deploy
+./run_kvcache.sh --prompt "你好" --max-tokens 2
+'
+```
+
+实测输出应包含：
+
+```text
+I/O: 58 in, 57 out
+[Prompt: 13 tokens]
+[step 1] post-execute
+...
+你好！
+Done.
+```
+
+注意：1.5 GB OM 首次 `acl.mdl.load_from_file` 可能需要约 75 秒，短时间无输出不一定是卡死。
 
 **可选参数**：
 
@@ -524,5 +649,4 @@ python3 gen_text_kvcache.py --prompt "你好，请介绍一下你自己" --max-t
 
 ---
 
-*最后更新：2026-06-08*
-
+*最后更新：2026-06-09*
