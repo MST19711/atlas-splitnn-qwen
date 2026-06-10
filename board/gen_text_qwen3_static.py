@@ -110,7 +110,7 @@ def generate(model, tok, prompt, max_new=50, temp=0.7, top_k=50, top_p=0.9):
         # Prepare left-padded input
         ids, mask, _ = pad_left(buffer, n_real)
         logits = model.execute(ids, mask)  # (32, vocab)
-        next_logits = logits[n_real - 1]  # last real position
+        next_logits = logits[-1]  # last position (left-padded input: real tokens at right)
         tid = sample(next_logits, temp, top_k, top_p)
 
         if tid == tok.eos_token_id:

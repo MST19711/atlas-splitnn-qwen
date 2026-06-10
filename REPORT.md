@@ -312,15 +312,9 @@ Qwen3.5 每步需要传入并更新以下状态：
 ### ATC 编译
 
 ```bash
-INPUT_SHAPE=$(pixi run python -c "
-import onnx
-m = onnx.load('om_out/qwen3.5_kvcache_max256.onnx')
-print(';'.join(i.name+':'+','.join(str(d.dim_value)
-    for d in i.type.tensor_type.shape.dim) for i in m.graph.input))
-")
-MODEL_ONNX=om_out/qwen3.5_kvcache_max256.onnx \
-INPUT_SHAPE="$INPUT_SHAPE" \
-IMAGE=localhost/cann-atc-rocky:v7 \
+# 注意：INPUT_SHAPE 值包含 50 个分号，必须先 export 再运行脚本，不能内联展开
+INPUT_SHAPE=$(pixi run python scripts/gen_input_shape.py om_out/qwen3.5_kvcache_max256.onnx)
+export INPUT_SHAPE MODEL_ONNX="om_out/qwen3.5_kvcache_max256.onnx"
 bash scripts/podman_convert.sh
 ```
 

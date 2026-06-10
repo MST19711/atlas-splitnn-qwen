@@ -8,7 +8,7 @@
 - **以上为 Atlas 200I DK A2 开发板出厂默认 IP 和密码**
 - SSH: `sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no root@192.168.137.100 '<cmd>'`
 - SCP: `sshpass -p 'Mind@123' scp <local> root@192.168.137.100:/root/slm_deploy/`
-- 板载已装: `torch(cpu) + transformers` (仅 tokenizer), numpy, acl
+- 板载已装 (出厂): `acl` (CANN 7.0.RC1 runtime 自带)。`numpy`, `transformers`, `tokenizers`, `huggingface-hub` 等需离线安装（板端无外网）
 - NPU 进程被 kill 后驱动不清理 → 重启板子
 
 ## Python 环境
@@ -76,6 +76,12 @@ podman build --network=host -t localhost/cann-atc-rocky:v7 \
 9. **gcc-c++**: CCE 编译器需要 C++ 标准库头文件, 容器需 `dnf install gcc-c++`
 10. **tokenizer 混乱**: Qwen3 和 Qwen3.5 的 tokenizer 文件互不兼容, SCP 时注意不要互相覆盖
 11. **桌面服务浪费内存**: sddm/xfce4-power-manager/xfce4-notifyd/tumblerd 可安全关闭, 回收 ~120 MiB RAM
+12. **板端 pip 安装必须 `--no-deps`**: `huggingface-hub>=0.34` 依赖 `hf-xet>=1.1.3`，但 PyPI 无 aarch64 wheel。板端 pip.conf 指向豆瓣镜像（无外网不可达），需用 pip wheel 自举安装而非 get-pip.py
+13. **板端需 jinja2**: `apply_chat_template(enable_thinking=False)` 触发 jinja2 模板渲染，板端需额外安装 `jinja2` + `markupsafe`（aarch64 wheel）
+14. **静态窗口 logits 索引 bug**: `gen_text_qwen3_static.py` 中 `pad_left()` 做左对齐，但 `generate()` 取 `logits[n_real-1]` 而非 `logits[-1]`。当 prompt < 32 token 时读到 padding 位置的乱码输出。已修复为 `logits[-1]`
+15. **ATC INPUT_SHAPE 不能内联展开**: KV Cache 模型的 `INPUT_SHAPE` 包含 50-58 个分号分隔的 shape 定义，shell 内联 `VAR=$(cmd) bash script.sh` 会把分号当命令分隔符。必须 `export INPUT_SHAPE` 后运行脚本
+16. **容器构建需 `--network=host`**: 容器内 `dnf install`/`pip install` 需要联网，不加 `--network=host` 可能导致下载失败
+17. **Qwen3 / Qwen3.5 tokenizer 互不兼容**: Qwen3 用 `vocab.json`+`merges.txt`，Qwen3.5 用 `tokenizer.json`。SCP 时注意不要互相覆盖
 
 ## 内存优化 (板端)
 板端 ATLAS 200I DK A2 出厂自带桌面环境, 推理场景可安全关闭:

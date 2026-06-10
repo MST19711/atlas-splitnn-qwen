@@ -74,28 +74,43 @@ wget -O docker/Ascend-cann-toolkit_7.0.0_linux-x86_64.run \   # ATC 编译器 (~
 wget -O docker/Ascend-cann-kernels-310b-7.0.0-linux.noarch.rpm \  # 310B 内核 (~351MB, 必须用 310B 而非 310P)
   "https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%207.0.0/Ascend-cann-kernels-310b-7.0.0-linux.noarch.rpm"
 
-# 构建 ATC 容器
-podman build -t localhost/cann-atc-rocky:v7 \
+# 构建 ATC 容器（需 --network=host 确保容器内 dnf/pip 可联网）
+podman build --network=host -t localhost/cann-atc-rocky:v7 \
     -f docker/Containerfile.v2-cann7 docker/
 ```
 
 #### 下载板端 Python wheel（在有网络的开发机上执行）
 
+板端推理脚本实际只依赖 `numpy` + `transformers`。**必须用 `--no-deps` 分别下载**，原因见下方说明。
+
 ```bash
 mkdir -p tmp
+
+# 主要依赖
 python3 -m pip download --dest tmp --platform manylinux2014_aarch64 \
-    --python-version 310 --implementation cp --abi cp310 --only-binary=:all: \
-    "numpy==1.26.4" \
-    "transformers==4.57.6" \
-    "tokenizers==0.22.2" \
-    "huggingface-hub>=0.34" \
-    "safetensors" "requests" "pyyaml" "regex" "tqdm" \
+    --python-version 310 --implementation cp --abi cp310 --only-binary=:all: --no-deps \
+    "numpy==1.26.4" "transformers==4.57.6" "tokenizers==0.22.2" \
+    "huggingface_hub==0.34.6" "safetensors" "requests" "pyyaml" "regex" "tqdm" \
     "filelock" "fsspec" "packaging" "typing-extensions" \
-    "httpx" "httpcore" "h11" "sniffio" "anyio" "exceptiongroup"
+    "certifi" "charset-normalizer" "idna" "urllib3"
+
+# jinja2 + markupsafe：apply_chat_template(enable_thinking=False) 需要
+python3 -m pip download --dest tmp --platform manylinux2014_aarch64 \
+    --python-version 310 --implementation cp --abi cp310 --only-binary=:all: --no-deps \
+    "markupsafe"
+python3 -m pip download --dest tmp --platform any \
+    --python-version 310 --only-binary=:all: --no-deps \
+    "jinja2"
+
+# pip 自举：板端出厂无 pip，且板端 pip.conf 指向不可达的豆瓣镜像
+python3 -m pip download --dest tmp --platform manylinux2014_aarch64 \
+    --python-version 310 --implementation cp --abi cp310 --only-binary=:all: --no-deps \
+    "pip" "setuptools" "wheel"
+
 curl -L https://bootstrap.pypa.io/get-pip.py -o tmp/get-pip.py
 ```
 
-> `transformers==4.57.6` 对 `tokenizers` 的版本限制为 `>=0.22.0,<=0.23.0`，而 PyPI 上可用的 aarch64 wheel 版为 `0.22.2` 和 `0.23.1`。`0.22.2` 无需额外处理，`0.23.1` 需放宽版本检查（见下文）。
+> **为什么 `--no-deps`？** `huggingface-hub>=0.34` 在 aarch64 平台要求 `hf-xet>=1.1.3`，但 PyPI 上 `hf-xet` 的 aarch64 wheel 最高只有 `0.1.x`。`hf-xet` 仅用于 HuggingFace Hub 并行下载加速，板端只通过 `AutoTokenizer.from_pretrained(local_dir)` 读取本地 tokenizer 文件，以 `--no-deps` 安装 huggingface-hub 安全可行。
 
 ### 2. 导出 ONNX → 编译 OM
 
@@ -111,8 +126,9 @@ pixi run python scripts/export_qwen35_kvcache.py --max-len 256 \
     --output om_out/qwen3.5_kvcache_max256.onnx
 
 # ATC 编译（统一命令，自动读取 ONNX 的 input shape）
-INPUT_SHAPE=$(pixi run python scripts/gen_input_shape.py om_out/qwen3.5_kvcache_max256.onnx) \
-MODEL_ONNX=om_out/qwen3.5_kvcache_max256.onnx \
+# 注意：INPUT_SHAPE 值包含分号，必须先 export 再运行，不能内联展开
+INPUT_SHAPE=$(pixi run python scripts/gen_input_shape.py om_out/qwen3.5_kvcache_max256.onnx)
+export INPUT_SHAPE MODEL_ONNX="om_out/qwen3.5_kvcache_max256.onnx" OUTPUT_PREFIX="om_out/qwen3.5_kvcache_max256"
 bash scripts/podman_convert.sh
 ```
 
@@ -132,36 +148,58 @@ bash scripts/podman_convert.sh
 
 ### 3. 板端环境
 
-开发板为 Ubuntu 22.04 aarch64，出厂预装 CANN 7.0.RC1。Python 依赖使用步骤 1 下载到 `tmp/` 的 wheel 离线安装。
+开发板为 Ubuntu 22.04 aarch64，出厂预装 CANN 7.0.RC1。板端 `/root/.pip/pip.conf` 配置了豆瓣镜像（无外网不可达），需用 pip wheel 自举安装。
+
+#### 传输文件
 
 ```bash
-# 从开发机传输 wheel 包到开发板
-scp tmp/*.whl tmp/get-pip.py root@192.168.137.100:/root/slm_deploy/wheels/
+sshpass -p 'Mind@123' ssh root@192.168.137.100 'mkdir -p /root/slm_deploy/wheels'
+sshpass -p 'Mind@123' scp tmp/*.whl tmp/get-pip.py root@192.168.137.100:/root/slm_deploy/wheels/
 ```
 
-在开发板上执行（开发板出厂无 pip，需通过 get-pip.py 自举）：
+#### 在开发板上安装
 
 ```bash
-cd /root/slm_deploy
+cd /root/slm_deploy/wheels
 
-# 安装 pip（出厂无 pip）
-python3 wheels/get-pip.py
+# 1. 用 pip wheel 自举安装 pip（get-pip.py 因镜像不可达会失败）
+python3 -c "
+import zipfile, sys, os
+whl = [f for f in os.listdir('.') if f.startswith('pip-')][0]
+zf = zipfile.ZipFile(whl)
+zf.extractall('/tmp/_pip')
+sys.path.insert(0, '/tmp/_pip')
+import pip._internal
+pip._internal.main(['install', '--no-deps', '--no-index', '--force-reinstall', whl])
+"
 
-# 安装依赖（torch 非必需，板端仅用 tokenizer，推理走 ACL）
-python3 -m pip install --no-index --find-links=wheels \
-    "numpy==1.26.4" "transformers==4.57.6" "tokenizers==0.22.2" \
-    "huggingface-hub>=0.34" \
-    "httpx" "httpcore" "h11" "sniffio" "anyio" "exceptiongroup" \
-    "safetensors" "requests" "pyyaml" "regex" "tqdm"
+# 2. 基础库（无上层依赖）
+python3 -m pip install --no-deps --no-index --find-links=. \
+    numpy-*.whl typing_extensions-*.whl packaging-*.whl filelock-*.whl \
+    fsspec-*.whl tqdm-*.whl regex-*.whl safetensors-*.whl
 
-# transformers 4.57.6 对 tokenizers 版本限制为 <=0.23.0，
-# 而 PyPI 上 aarch64 wheel 最新为 0.23.1，需放宽版本检查：
+# 3. huggingface-hub（--no-deps 跳过 hf-xet）
+python3 -m pip install --no-deps --no-index --find-links=. \
+    huggingface_hub-0.34.6-*.whl
+
+# 4. requests → tokenizers → transformers
+python3 -m pip install --no-deps --no-index --find-links=. \
+    requests-*.whl charset_normalizer-*.whl tokenizers-*.whl transformers-*.whl
+
+# 5. jinja2 + markupsafe（chat template 模板渲染需要）
+python3 -m pip install --no-deps --no-index --find-links=. \
+    markupsafe-*.whl jinja2-*.whl
+
+# 6. 放宽 tokenizers 版本上限
 sed -i 's/tokenizers>=0.22.0,<=0.23.0/tokenizers>=0.22.0,<=0.23.1/' \
   /usr/local/lib/python3.10/dist-packages/transformers/dependency_versions_table.py
 
+# 7. 验证
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
-python3 -c "import acl, numpy, transformers; print('OK')"
+python3 -c "import acl, numpy, transformers, tokenizers, huggingface_hub, safetensors, jinja2; print('OK')"
 ```
+
+> **关于 `hf-xet`**：`huggingface-hub>=0.34` 在 aarch64 上依赖 `hf-xet>=1.1.3`，但 PyPI 上 `hf-xet` 仅 `0.1.x` 提供 aarch64 wheel。`hf-xet` 仅用于 HuggingFace Hub 并行下载，板端只通过 `from_pretrained(local_dir)` 读本地 tokenizer 文件，不会触发下载路径。
 
 可选：关闭桌面服务释放 ~120MB 内存：
 
@@ -177,17 +215,32 @@ pkill -f tumblerd
 从开发机传输文件：
 
 ```bash
-scp om_out/qwen3.5_kvcache_max256.om root@192.168.137.100:/root/slm_deploy/
-scp board/gen_text_qwen35_kvcache.py      root@192.168.137.100:/root/slm_deploy/
+# Qwen3 KV Cache
+scp om_out/qwen3_kvcache_max256_cann7.om root@192.168.137.100:/root/slm_deploy/
+scp board/gen_text_qwen3_kvcache.py          root@192.168.137.100:/root/slm_deploy/
+
+# Qwen3.5 KV Cache（tokenizer 与 Qwen3 不兼容，需单独传输）
+scp om_out/qwen3.5_kvcache_max256.om         root@192.168.137.100:/root/slm_deploy/
+scp board/gen_text_qwen35_kvcache.py          root@192.168.137.100:/root/slm_deploy/
+scp model/Qwen3.5-0.8B/tokenizer.json model/Qwen3.5-0.8B/tokenizer_config.json \
+    model/Qwen3.5-0.8B/chat_template.jinja     root@192.168.137.100:/root/slm_deploy/
 ```
+
+> **tokenizer 兼容性**：Qwen3 使用 `vocab.json` + `merges.txt`，Qwen3.5 使用 `tokenizer.json`。两者互不兼容，部署时注意不要互相覆盖。
 
 在开发板上运行：
 
 ```bash
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 cd /root/slm_deploy
+
+# Qwen3 KV Cache
+python3 gen_text_qwen3_kvcache.py \
+    --model qwen3_kvcache_max256_cann7.om --prompt "你好" --max-tokens 50
+
+# Qwen3.5 KV Cache
 python3 gen_text_qwen35_kvcache.py \
-    --model qwen3.5_kvcache_max256.om \
+    --model qwen3.5_kvcache_max256.om --tokenizer-dir /root/slm_deploy \
     --prompt "你好" --max-tokens 50
 ```
 
