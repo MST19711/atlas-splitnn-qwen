@@ -11,7 +11,7 @@ else
 fi
 
 cd /root/slm_deploy
-exec python3 -u gen_text_kvcache.py \
-  --model /root/slm_deploy/qwen3_kvcache_max256_b4.om \
+exec python3 -u gen_text_qwen3_kvcache.py \
+  --model /root/slm_deploy/qwen3_kvcache_max256_cann7.om \
   --tokenizer-dir /root/slm_deploy \
   "$@"

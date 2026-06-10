@@ -5,9 +5,10 @@
 *.log
 *.safetensors
 model/
+models/
 
 # CANN / build
-cann8_install/
+cann_install/
 kernel_meta/
 om_out/
 logs/
@@ -19,11 +20,9 @@ logs/
 .codegraph/
 .opencode/
 atc_monitor.sh
-cann_install/
 __pycache__/
 docker/*.run
 docker/*.rpm
-cann_install/
 docker/b4_data/
 fusion_result.json
 tmp/

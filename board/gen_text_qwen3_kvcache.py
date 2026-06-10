@@ -210,7 +210,7 @@ def generate(model, tok, prompt, max_new=5, temp=0.7, top_k=40, top_p=0.9):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="/root/slm_deploy/qwen3_kvcache_max256_b4.om")
+    p.add_argument("--model", default="/root/slm_deploy/qwen3_kvcache_max256_cann7.om")
     p.add_argument("--tokenizer-dir", default="/root/slm_deploy")
     p.add_argument("--prompt", default="你好")
     p.add_argument("--max-tokens", type=int, default=5)

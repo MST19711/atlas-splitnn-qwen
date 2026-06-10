@@ -36,7 +36,7 @@ def add_buffer(dataset, ptr, size):
 
 def main():
     parser = argparse.ArgumentParser(description="Run one fixed-input ACL inference for the OM model.")
-    parser.add_argument("--model", default="/root/slm_deploy/qwen3_fp16_seq1.om")
+    parser.add_argument("--model", required=True, help="OM file path")
     parser.add_argument("--seq-len", type=int, default=1)
     args = parser.parse_args()
 

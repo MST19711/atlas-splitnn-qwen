@@ -28,7 +28,7 @@ class StaticForwardWrapper(torch.nn.Module):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", default="models/Qwen3-0.6B")
+    parser.add_argument("--model-path", default="model/Qwen3-0.6B")
     parser.add_argument("--output", default="qwen3_fp16_seq32_v2.onnx")
     parser.add_argument("--seq-len", type=int, default=32)
     parser.add_argument("--validate", action="store_true", default=True)

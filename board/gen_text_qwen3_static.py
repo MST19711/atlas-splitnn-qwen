@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Qwen3-0.6B FP16 滑动窗口文本生成 (Atlas 200I DK A2 / Ascend310B4).
+Qwen3-0.6B FP16 静态窗口文本生成 (Atlas 200I DK A2 / Ascend310B4).
 
 seq_len=32 固定窗口 + left-padding + causal mask。
 Instruct 模型，使用 chat_template 格式化对话。
 
 用法:
-    python3 gen_text.py --prompt "你好，介绍一下量子计算"
-    python3 gen_text.py --prompt "What is machine learning?" --max-tokens 50
+    python3 gen_text_qwen3_static.py --prompt "你好"
 """
 
 import argparse, sys, time, warnings, numpy as np

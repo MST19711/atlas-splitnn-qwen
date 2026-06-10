@@ -3,7 +3,7 @@ set -euo pipefail
 # Usage: MODEL_ONNX=model.onnx INPUT_SHAPE="a:1,2;b:3,4" [OUTPUT_PREFIX=om_out/model] bash scripts/podman_convert.sh
 
 PROJECT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-IMAGE=${IMAGE:-localhost/cann-atc-ubuntu22:v4}
+IMAGE=${IMAGE:-localhost/cann-atc-rocky:v7}
 
 : "${MODEL_ONNX:?Need MODEL_ONNX}"
 : "${INPUT_SHAPE:?Need INPUT_SHAPE}"

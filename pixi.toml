@@ -16,24 +16,6 @@ numpy = ">=2.2.6,<3"
 safetensors = ">=0.7.0,<0.8"
 huggingface_hub = ">=1.18.0,<2"
 accelerate = ">=1.13.0,<2"
-onnxscript = ">=0.5.6,<0.6"
-
-[feature.cann-py39.dependencies]
-python = "3.9.*"
-numpy = "<2"
-decorator = ">=5.2.1,<6"
-sympy = ">=1.14.0,<2"
-scipy = ">=1.13.1,<2"
-attr = ">=2.5.2,<3"
-pip = ">=25.2,<26"
-
-[feature.cann-py39.pypi-dependencies]
-attrs = ">=26.1.0, <27"
-psutil = ">=7.2.2, <8"
-
-[environments]
-cann-py39 = { features = ["cann-py39"], no-default-feature = true }
 
 [pypi-dependencies]
 onnxsim = ">=0.6.4, <0.7"
-sentencepiece = ">=0.2.1, <0.3"

@@ -5,6 +5,7 @@
 
 ## 开发板
 - `root@192.168.137.100`, 密码 `Mind@123`, Atlas 200I DK A2 (Ascend310B4)
+- **以上为 Atlas 200I DK A2 开发板出厂默认 IP 和密码**
 - SSH: `sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no root@192.168.137.100 '<cmd>'`
 - SCP: `sshpass -p 'Mind@123' scp <local> root@192.168.137.100:/root/slm_deploy/`
 - 板载已装: `torch(cpu) + transformers` (仅 tokenizer), numpy, acl
@@ -18,20 +19,21 @@
 ## 项目结构
 ```
 scripts/        # ONNX 导出 + ATC 转换 (x86 dev)
-  export_fp16.py        seq=N 静态导出
-  export_kvcache.py     KV Cache 导出 (monkey-patch Qwen3Attention)
-  export_qwen35.py      Qwen3.5 KV Cache 导出 (4 个轻量 patch: cat→Where, Trilu, RMSNorm, conv)
-  patch_onnx.py         GQA Expand→Tile
+  export_qwen3_static.py        seq=N 静态导出
+  export_qwen3_kvcache.py     KV Cache 导出 (monkey-patch Qwen3Attention)
+  export_qwen35_kvcache.py      Qwen3.5 KV Cache 导出 (4 个轻量 patch: cat→Where, Trilu, RMSNorm, conv)
+  patch_qwen3_static_onnx.py         GQA Expand→Tile
   podman_convert.sh
 board/          # 板载推理 (aarch64)
-  gen_text_seq32.py       seq=32 滑动窗口
-  gen_text_kvcache.py     Qwen3 KV Cache (max_len=256)
-  gen_text_qwen35.py      Qwen3.5 KV Cache (max_len=256, DeltaNet)
+  gen_text_qwen3_static.py       seq=32 滑动窗口
+  gen_text_qwen3_kvcache.py     Qwen3 KV Cache (max_len=256)
+  gen_text_qwen35_kvcache.py      Qwen3.5 KV Cache (max_len=256, DeltaNet)
   acl_verify.py           ACL 验证
 docker/
   Containerfile.v2-cann7  # CANN 7.0 + 310B 内核 (Rocky 9), 镜像: cann-atc-rocky:v7
 model/
   Qwen3-0.6B/             # Qwen3 模型权重 + tokenizer
+  Qwen3.5-0.8B/           # Qwen3.5 模型权重 + tokenizer
 om_out/ logs/
 ```
 
@@ -66,7 +68,7 @@ podman build --network=host -t localhost/cann-atc-rocky:v7 \
 1. **ACL API**: `acl.mdl.add_dataset_buffer(ds,buf)` 返回 tuple `(ptr,ret)`, 需 `_, ret = ...`
 2. **TBE ccec**: `tbe/tvm/contrib/ccec.py` 硬编码 `/usr/local/Ascend/CANN-1.84/` → 容器内 symlink
 3. **310B内核**: 必须用 `Ascend-cann-kernels-310b` (非 310P 或其他型号), 否则 soc_version=Ascend310B4 失败
-4. **GQA Expand**: seq=N 导出后需 `patch_onnx.py` 修复 56 个动态 Expand
+4. **GQA Expand**: seq=N 导出后需 `patch_qwen3_static_onnx.py` 修复 56 个动态 Expand
 5. **thinking**: Qwen3 0.6B 需 `enable_thinking=False`
 6. **NPU 泄漏**: kill 后内存不释放 → reboot
 7. **numpy<2**: CANN 7 TBE 不兼容 numpy 2.x, 需要 `pip3 install 'numpy<2'`
@@ -89,10 +91,10 @@ pkill -f tumblerd
 ## 导出 KV Cache 模型
 ```bash
 # Qwen3
-pixi run python scripts/export_kvcache.py --max-len 256 --output om_out/qwen3_kvcache_max256.onnx
+pixi run python scripts/export_qwen3_kvcache.py --max-len 256 --output om_out/qwen3_kvcache_max256.onnx
 
 # Qwen3.5
-pixi run python scripts/export_qwen35.py --max-len 256 --output om_out/qwen3.5_kvcache_max256.onnx
+pixi run python scripts/export_qwen35_kvcache.py --max-len 256 --output om_out/qwen3.5_kvcache_max256.onnx
 
-# ORT 多步验证 → ATC → SCP → board/gen_text_kvcache.py
+# ORT 多步验证 → ATC → SCP → board/gen_text_qwen3_kvcache.py / board/gen_text_qwen35_kvcache.py
 ```
