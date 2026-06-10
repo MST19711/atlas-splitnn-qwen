@@ -210,9 +210,9 @@ def main():
     N = args.max_len
 
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_path, torch_dtype=torch.float16,
+        args.model_path, torch_dtype=torch.bfloat16,
         device_map="cpu", trust_remote_code=True,
-    ).eval()
+    ).eval().to(torch.float16)
     model.config._attn_implementation = "eager"
     model.model.config._attn_implementation = "eager"
     for layer in model.model.layers:
