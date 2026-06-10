@@ -83,25 +83,19 @@ podman build -t localhost/cann-atc-rocky:v7 \
 
 ```bash
 mkdir -p tmp
-
-# 1) 编译型包（aarch64 原生 wheel）
 python3 -m pip download --dest tmp --platform manylinux2014_aarch64 \
     --python-version 310 --implementation cp --abi cp310 --only-binary=:all: \
-    "numpy==1.26.4" "tokenizers==0.22.2"
-
-# 2) 纯 Python 包（平台无关 wheel）
-python3 -m pip download --dest tmp --platform any \
-    --python-version 310 --implementation cp --abi cp310 --only-binary=:all: \
+    "numpy==1.26.4" \
     "transformers==4.57.6" \
-    "huggingface-hub>=0.34,<1.0" \
+    "tokenizers==0.22.2" \
+    "huggingface-hub>=0.34" \
     "safetensors" "requests" "pyyaml" "regex" "tqdm" \
     "filelock" "fsspec" "packaging" "typing-extensions" \
     "httpx" "httpcore" "h11" "sniffio" "anyio" "exceptiongroup"
-
 curl -L https://bootstrap.pypa.io/get-pip.py -o tmp/get-pip.py
 ```
 
-> `transformers==4.57.6` 对 `tokenizers` 的版本限制为 `>=0.22.0,<=0.23.0`，但 PyPI 上 aarch64 wheel 最新为 `0.23.1`。板端安装后需 patch 版本检查（见下文）。
+> `transformers==4.57.6` 对 `tokenizers` 的版本限制为 `>=0.22.0,<=0.23.0`，而 PyPI 上可用的 aarch64 wheel 版为 `0.22.2` 和 `0.23.1`。`0.22.2` 无需额外处理，`0.23.1` 需放宽版本检查（见下文）。
 
 ### 2. 导出 ONNX → 编译 OM
 

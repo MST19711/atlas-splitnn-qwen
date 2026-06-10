@@ -85,12 +85,17 @@ podman build -t localhost/cann-atc-rocky:v7 \
 mkdir -p tmp
 python3 -m pip download --dest tmp --platform manylinux2014_aarch64 \
     --python-version 310 --implementation cp --abi cp310 --only-binary=:all: \
-    "numpy==1.26.4" "transformers==4.53.3" "tokenizers==0.21.4" \
-    "torch==2.1.0" "safetensors" "huggingface-hub" "requests" \
-    "pyyaml" "regex" "tqdm" "filelock" "fsspec" "packaging" \
-    "typing-extensions" "sympy" "networkx" "jinja2"
+    "numpy==1.26.4" \
+    "transformers==4.57.6" \
+    "tokenizers==0.22.2" \
+    "huggingface-hub>=0.34" \
+    "safetensors" "requests" "pyyaml" "regex" "tqdm" \
+    "filelock" "fsspec" "packaging" "typing-extensions" \
+    "httpx" "httpcore" "h11" "sniffio" "anyio" "exceptiongroup"
 curl -L https://bootstrap.pypa.io/get-pip.py -o tmp/get-pip.py
 ```
+
+> `transformers==4.57.6` pins `tokenizers` to `>=0.22.0,<=0.23.0`. Available aarch64 wheels on PyPI are `0.22.2` (no extra step) and `0.23.1` (requires the `sed` patch below).
 
 ### 2. Export ONNX → ATC → OM
 
