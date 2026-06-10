@@ -62,7 +62,7 @@ Deploy Qwen3-0.6B and Qwen3.5-0.8B small language models on the Huawei Ascend At
 #### Dev Machine (x86_64)
 
 ```bash
-cd Embedded_FinalHW && pixi install
+cd EF && pixi install
 
 # Download model weights
 hf download Qwen/Qwen3-0.6B --local-dir model/Qwen3-0.6B
@@ -126,13 +126,26 @@ Transfer wheels from dev machine:
 scp tmp/*.whl tmp/get-pip.py root@192.168.137.100:/root/slm_deploy/wheels/
 ```
 
-On the board:
+On the board (no pip shipped, bootstrap via get-pip.py):
 
 ```bash
 cd /root/slm_deploy
+
+# Bootstrap pip (not shipped with the board)
 python3 wheels/get-pip.py
+
+# Install dependencies (torch not required — board uses tokenizer only, ACL for inference)
 python3 -m pip install --no-index --find-links=wheels \
-    "numpy==1.26.4" transformers torch
+    "numpy==1.26.4" "transformers==4.57.6" "tokenizers==0.22.2" \
+    "huggingface-hub>=0.34" \
+    "httpx" "httpcore" "h11" "sniffio" "anyio" "exceptiongroup" \
+    "safetensors" "requests" "pyyaml" "regex" "tqdm"
+
+# transformers 4.57.6 pins tokenizers to <=0.23.0,
+# but the latest aarch64 wheel on PyPI is 0.23.1 — relax the check:
+sed -i 's/tokenizers>=0.22.0,<=0.23.0/tokenizers>=0.22.0,<=0.23.1/' \
+  /usr/local/lib/python3.10/dist-packages/transformers/dependency_versions_table.py
+
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 python3 -c "import acl, numpy, transformers; print('OK')"
 ```

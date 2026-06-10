@@ -62,7 +62,7 @@
 #### 开发机 (x86_64)
 
 ```bash
-cd Embedded_FinalHW && pixi install
+cd EF && pixi install
 
 # 下载模型权重
 hf download Qwen/Qwen3-0.6B --local-dir model/Qwen3-0.6B
@@ -83,14 +83,25 @@ podman build -t localhost/cann-atc-rocky:v7 \
 
 ```bash
 mkdir -p tmp
+
+# 1) 编译型包（aarch64 原生 wheel）
 python3 -m pip download --dest tmp --platform manylinux2014_aarch64 \
     --python-version 310 --implementation cp --abi cp310 --only-binary=:all: \
-    "numpy==1.26.4" "transformers==4.53.3" "tokenizers==0.21.4" \
-    "torch==2.1.0" "safetensors" "huggingface-hub" "requests" \
-    "pyyaml" "regex" "tqdm" "filelock" "fsspec" "packaging" \
-    "typing-extensions" "sympy" "networkx" "jinja2"
+    "numpy==1.26.4" "tokenizers==0.22.2"
+
+# 2) 纯 Python 包（平台无关 wheel）
+python3 -m pip download --dest tmp --platform any \
+    --python-version 310 --implementation cp --abi cp310 --only-binary=:all: \
+    "transformers==4.57.6" \
+    "huggingface-hub>=0.34,<1.0" \
+    "safetensors" "requests" "pyyaml" "regex" "tqdm" \
+    "filelock" "fsspec" "packaging" "typing-extensions" \
+    "httpx" "httpcore" "h11" "sniffio" "anyio" "exceptiongroup"
+
 curl -L https://bootstrap.pypa.io/get-pip.py -o tmp/get-pip.py
 ```
+
+> `transformers==4.57.6` 对 `tokenizers` 的版本限制为 `>=0.22.0,<=0.23.0`，但 PyPI 上 aarch64 wheel 最新为 `0.23.1`。板端安装后需 patch 版本检查（见下文）。
 
 ### 2. 导出 ONNX → 编译 OM
 
@@ -134,13 +145,26 @@ bash scripts/podman_convert.sh
 scp tmp/*.whl tmp/get-pip.py root@192.168.137.100:/root/slm_deploy/wheels/
 ```
 
-在开发板上执行：
+在开发板上执行（开发板出厂无 pip，需通过 get-pip.py 自举）：
 
 ```bash
 cd /root/slm_deploy
+
+# 安装 pip（出厂无 pip）
 python3 wheels/get-pip.py
+
+# 安装依赖（torch 非必需，板端仅用 tokenizer，推理走 ACL）
 python3 -m pip install --no-index --find-links=wheels \
-    "numpy==1.26.4" transformers torch
+    "numpy==1.26.4" "transformers==4.57.6" "tokenizers==0.22.2" \
+    "huggingface-hub>=0.34" \
+    "httpx" "httpcore" "h11" "sniffio" "anyio" "exceptiongroup" \
+    "safetensors" "requests" "pyyaml" "regex" "tqdm"
+
+# transformers 4.57.6 对 tokenizers 版本限制为 <=0.23.0，
+# 而 PyPI 上 aarch64 wheel 最新为 0.23.1，需放宽版本检查：
+sed -i 's/tokenizers>=0.22.0,<=0.23.0/tokenizers>=0.22.0,<=0.23.1/' \
+  /usr/local/lib/python3.10/dist-packages/transformers/dependency_versions_table.py
+
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 python3 -c "import acl, numpy, transformers; print('OK')"
 ```
