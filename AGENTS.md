@@ -73,6 +73,18 @@ podman build --network=host -t localhost/cann-atc-rocky:v7 \
 8. **TBE 依赖**: 需 `pip3 install attrs cloudpickle psutil synr tornado` (te 包依赖)
 9. **gcc-c++**: CCE 编译器需要 C++ 标准库头文件, 容器需 `dnf install gcc-c++`
 10. **tokenizer 混乱**: Qwen3 和 Qwen3.5 的 tokenizer 文件互不兼容, SCP 时注意不要互相覆盖
+11. **桌面服务浪费内存**: sddm/xfce4-power-manager/xfce4-notifyd/tumblerd 可安全关闭, 回收 ~120 MiB RAM
+
+## 内存优化 (板端)
+板端 ATLAS 200I DK A2 出厂自带桌面环境, 推理场景可安全关闭:
+```bash
+systemctl stop sddm && systemctl disable sddm
+pkill -f xfce4-power-manager
+pkill -f xfce4-notifyd
+pkill -f tumblerd
+```
+- 不影响: 网络管理 (NetworkManager/systemd-networkd), 文件系统 (udisks2/gvfs), 音频 (pulseaudio/pipewire), 通信 (ModemManager), 更新 (unattended-upgrades)
+- 效果: 665 MiB → 544 MiB, 释放约 121 MiB
 
 ## 导出 KV Cache 模型
 ```bash

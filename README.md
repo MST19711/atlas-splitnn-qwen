@@ -374,19 +374,6 @@ DeltaNet 的 recurrent 计算部分**完全不需要 patch**——直接调用 `
 
 这个发现将 Qwen3.5 的 monkey-patch 从原来的 ~100 行（手写 delta_step + 完整 DeltaNet forward）精简为 4 个轻量 patch。
 
-### DeltaNet 原理
-
-DeltaNet 用矩阵状态 `S`（shape `[k_heads, k_dim, v_dim]`）替代 KV Cache。每一步：
-
-1. **L2 Normalize** Q 和 K：`q = q / ||q||₂`, `k = k / ||k||₂`
-2. **Scaling**：`q = q * d⁻⁰·⁵`
-3. **Gating**：`S_new = S * exp(g)`
-4. **Delta**：`delta = (v - S_new @ k) * sigmoid(beta)`
-5. **状态更新**：`S_new = S_new + k ⊗ delta`
-6. **输出**：`out = S_new @ q`
-
-此外还有 **CausalConv1D**：每个 DeltaNet 层先对输入做 4-wide 因果卷积（引入局部上下文），conv 的内部状态（最后 3 个 time step 的隐向量）也需要在每步间传递。
-
 ### Monkey-patch：四个轻量修复
 
 与之前手写 `delta_step` 的方案不同，重构后的版本只修四个问题，DeltaNet 的 recurrent 计算直接使用原生 torch 函数：
@@ -932,6 +919,29 @@ sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no \
     root@192.168.137.100 \
     'sha256sum /root/slm_deploy/qwen3_kvcache_max256_cann7.om'
 ```
+
+### 内存优化（可选）
+
+ATLAS 200I DK A2 出厂自带桌面环境，推理场景下可安全关闭以下服务以回收内存：
+
+```bash
+# 关闭桌面环境相关服务
+systemctl stop sddm && systemctl disable sddm
+pkill -f xfce4-power-manager
+pkill -f xfce4-notifyd
+pkill -f tumblerd
+```
+
+| 服务 | 占用 (RSS) | 说明 |
+|------|-----------|------|
+| sddm | ~14 MB | 显示管理器 |
+| xfce4-power-manager | ~17 MB | 桌面电源管理 |
+| xfce4-notifyd | ~17 MB | 桌面通知 |
+| tumblerd | ~18 MB | 缩略图生成 |
+
+**效果**：665 MiB → 544 MiB，释放约 **121 MiB**。
+
+不影响：网络管理（NetworkManager/systemd-networkd）、文件系统（udisks2/gvfs）、音频（pulseaudio/pipewire）、通信（ModemManager）、自动更新（unattended-upgrades）。
 
 ### 运行推理
 
