@@ -32,6 +32,8 @@ Transformer 每层的注意力需要计算 Key、Query、Value。没有缓存时
 
 ## 阶段一：静态窗口模型
 
+> **注意**：此方案在 CANN 7.1.0.3.220 + Ascend310B4 下经验证不可用（ATC 编译产物输出与 ONNX 不匹配），相关代码（`scripts/export_qwen3_static.py`、`scripts/patch_qwen3_static_onnx.py`、`board/gen_text_qwen3_static.py`）已从仓库移除。本节仅作历史参考。
+
 ### 思路
 
 不用 KV Cache。每次把完整序列 left-pad 到固定长度（比如 32），一次性送入模型。尽管有重复计算，但实现简单，适合快速验证全链路。

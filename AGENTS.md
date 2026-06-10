@@ -19,13 +19,10 @@
 ## 项目结构
 ```
 scripts/        # ONNX 导出 + ATC 转换 (x86 dev)
-  export_qwen3_static.py        seq=N 静态导出
   export_qwen3_kvcache.py     KV Cache 导出 (monkey-patch Qwen3Attention)
   export_qwen35_kvcache.py      Qwen3.5 KV Cache 导出 (4 个轻量 patch: cat→Where, Trilu, RMSNorm, conv)
-  patch_qwen3_static_onnx.py         GQA Expand→Tile
   podman_convert.sh
 board/          # 板载推理 (aarch64)
-  gen_text_qwen3_static.py       seq=32 滑动窗口
   gen_text_qwen3_kvcache.py     Qwen3 KV Cache (max_len=256)
   gen_text_qwen35_kvcache.py      Qwen3.5 KV Cache (max_len=256, DeltaNet)
   acl_verify.py           ACL 验证
@@ -68,20 +65,19 @@ podman build --network=host -t localhost/cann-atc-rocky:v7 \
 1. **ACL API**: `acl.mdl.add_dataset_buffer(ds,buf)` 返回 tuple `(ptr,ret)`, 需 `_, ret = ...`
 2. **TBE ccec**: `tbe/tvm/contrib/ccec.py` 硬编码 `/usr/local/Ascend/CANN-1.84/` → 容器内 symlink
 3. **310B内核**: 必须用 `Ascend-cann-kernels-310b` (非 310P 或其他型号), 否则 soc_version=Ascend310B4 失败
-4. **GQA Expand**: seq=N 导出后需 `patch_qwen3_static_onnx.py` 修复 56 个动态 Expand
-5. **thinking**: Qwen3 0.6B 需 `enable_thinking=False`
-6. **NPU 泄漏**: kill 后内存不释放 → reboot
-7. **numpy<2**: CANN 7 TBE 不兼容 numpy 2.x, 需要 `pip3 install 'numpy<2'`
-8. **TBE 依赖**: 需 `pip3 install attrs cloudpickle psutil synr tornado` (te 包依赖)
-9. **gcc-c++**: CCE 编译器需要 C++ 标准库头文件, 容器需 `dnf install gcc-c++`
-10. **tokenizer 混乱**: Qwen3 和 Qwen3.5 的 tokenizer 文件互不兼容, SCP 时注意不要互相覆盖
-11. **桌面服务浪费内存**: sddm/xfce4-power-manager/xfce4-notifyd/tumblerd 可安全关闭, 回收 ~120 MiB RAM
-12. **板端 pip 安装必须 `--no-deps`**: `huggingface-hub>=0.34` 依赖 `hf-xet>=1.1.3`，但 PyPI 无 aarch64 wheel。板端 pip.conf 指向豆瓣镜像（无外网不可达），需用 pip wheel 自举安装而非 get-pip.py
-13. **板端需 jinja2**: `apply_chat_template(enable_thinking=False)` 触发 jinja2 模板渲染，板端需额外安装 `jinja2` + `markupsafe`（aarch64 wheel）
-14. **静态窗口 logits 索引 bug**: `gen_text_qwen3_static.py` 中 `pad_left()` 做左对齐，但 `generate()` 取 `logits[n_real-1]` 而非 `logits[-1]`。当 prompt < 32 token 时读到 padding 位置的乱码输出。已修复为 `logits[-1]`
-15. **ATC INPUT_SHAPE 不能内联展开**: KV Cache 模型的 `INPUT_SHAPE` 包含 50-58 个分号分隔的 shape 定义，shell 内联 `VAR=$(cmd) bash script.sh` 会把分号当命令分隔符。必须 `export INPUT_SHAPE` 后运行脚本
-16. **容器构建需 `--network=host`**: 容器内 `dnf install`/`pip install` 需要联网，不加 `--network=host` 可能导致下载失败
-17. **Qwen3 / Qwen3.5 tokenizer 互不兼容**: Qwen3 用 `vocab.json`+`merges.txt`，Qwen3.5 用 `tokenizer.json`。SCP 时注意不要互相覆盖
+4. **thinking**: Qwen3 0.6B 需 `enable_thinking=False`
+5. **NPU 泄漏**: kill 后内存不释放 → reboot
+6. **numpy<2**: CANN 7 TBE 不兼容 numpy 2.x, 需要 `pip3 install 'numpy<2'`
+7. **TBE 依赖**: 需 `pip3 install attrs cloudpickle psutil synr tornado` (te 包依赖)
+8. **gcc-c++**: CCE 编译器需要 C++ 标准库头文件, 容器需 `dnf install gcc-c++`
+9. **tokenizer 混乱**: Qwen3 和 Qwen3.5 的 tokenizer 文件互不兼容, SCP 时注意不要互相覆盖
+10. **桌面服务浪费内存**: sddm/xfce4-power-manager/xfce4-notifyd/tumblerd 可安全关闭, 回收 ~120 MiB RAM
+11. **板端 pip 安装必须 `--no-deps`**: `huggingface-hub>=0.34` 依赖 `hf-xet>=1.1.3`，但 PyPI 无 aarch64 wheel。板端 pip.conf 指向豆瓣镜像（无外网不可达），需用 pip wheel 自举安装而非 get-pip.py
+12. **板端需 jinja2**: `apply_chat_template(enable_thinking=False)` 触发 jinja2 模板渲染，板端需额外安装 `jinja2` + `markupsafe`（aarch64 wheel）
+13. **静态窗口模型不可用**: Qwen3 静态窗口 (seq=32) 在 CANN 7.1.0.3.220 + Ascend310B4 下 ATC 编译产物输出错误，相关代码已从仓库移除。仅 KV Cache 方案可用
+14. **ATC INPUT_SHAPE 不能内联展开**: KV Cache 模型的 `INPUT_SHAPE` 包含 50-58 个分号分隔的 shape 定义，shell 内联 `VAR=$(cmd) bash script.sh` 会把分号当命令分隔符。必须 `export INPUT_SHAPE` 后运行脚本
+15. **容器构建需 `--network=host`**: 容器内 `dnf install`/`pip install` 需要联网，不加 `--network=host` 可能导致下载失败
+16. **Qwen3 / Qwen3.5 tokenizer 互不兼容**: Qwen3 用 `vocab.json`+`merges.txt`，Qwen3.5 用 `tokenizer.json`。SCP 时注意不要互相覆盖
 
 ## 内存优化 (板端)
 板端 ATLAS 200I DK A2 出厂自带桌面环境, 推理场景可安全关闭:

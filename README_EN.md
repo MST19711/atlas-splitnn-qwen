@@ -10,7 +10,6 @@ Deploy Qwen3-0.6B and Qwen3.5-0.8B small language models on the Huawei Ascend At
 
 | Model | Context | Prefill | Decode | OM Size |
 |-------|---------|---------|--------|---------|
-| Qwen3 static window | 32 tok | — | 3.6 tok/s | 1.5 GB |
 | Qwen3 KV Cache | 256 tok | ~5.6s | 3.6 tok/s | 1.5 GB |
 | Qwen3.5 KV Cache | 256 tok | ~52s | 3.7 tok/s | 1.9 GB |
 | Qwen3.5 KV Cache | 1024 tok | ~67s | 3.6 tok/s | 1.9 GB |
@@ -35,15 +34,11 @@ Deploy Qwen3-0.6B and Qwen3.5-0.8B small language models on the Huawei Ascend At
 ```
 ├── model/                    # Model weights + tokenizer
 ├── scripts/                  # ONNX export & ATC conversion (x86)
-│   ├── export_qwen3_static.py        # Qwen3 static window export
 │   ├── export_qwen3_kvcache.py     # Qwen3 KV Cache export
 │   ├── export_qwen35_kvcache.py      # Qwen3.5 DeltaNet KV Cache export
-│   ├── patch_qwen3_static_onnx.py         # GQA Expand→Tile (static window only)
 │   ├── gen_input_shape.py    # ONNX → ATC INPUT_SHAPE helper
 │   ├── podman_convert.sh     # Containerized ATC conversion
-│   └── download_qwen3.py     # HF model download
 ├── board/                    # On-board inference (aarch64)
-│   ├── gen_text_qwen3_static.py     # Static window inference
 │   ├── gen_text_qwen3_kvcache.py   # Qwen3 KV Cache inference
 │   ├── gen_text_qwen35_kvcache.py    # Qwen3.5 DeltaNet inference
 │   └── run_qwen3_kvcache.sh
@@ -115,10 +110,7 @@ curl -L https://bootstrap.pypa.io/get-pip.py -o tmp/get-pip.py
 ### 2. Export ONNX → ATC → OM
 
 ```bash
-# Export ONNX (pick one; customize --max-len as needed)
-pixi run python scripts/export_qwen3_static.py \
-    --output om_out/qwen3_seq32.onnx
-
+# Export ONNX (customize --max-len as needed)
 pixi run python scripts/export_qwen3_kvcache.py --max-len 256 \
     --output om_out/qwen3_kvcache_max256.onnx
 
@@ -131,11 +123,6 @@ INPUT_SHAPE=$(pixi run python scripts/gen_input_shape.py om_out/qwen3.5_kvcache_
 export INPUT_SHAPE MODEL_ONNX="om_out/qwen3.5_kvcache_max256.onnx" OUTPUT_PREFIX="om_out/qwen3.5_kvcache_max256"
 bash scripts/podman_convert.sh
 ```
-
-> Static window model requires `patch_qwen3_static_onnx.py` before ATC:
-> ```bash
-> pixi run python scripts/patch_qwen3_static_onnx.py om_out/qwen3_seq32.onnx
-> ```
 
 ### 3. Board Setup
 
@@ -239,7 +226,6 @@ Inference scripts:
 
 | Script | Model | Key Parameters |
 |--------|-------|----------------|
-| `gen_text_qwen3_static.py` | Qwen3 static window | `--prompt`, `--max-tokens` |
 | `gen_text_qwen3_kvcache.py` | Qwen3 KV Cache | `--model X.om --prompt` |
 | `gen_text_qwen35_kvcache.py` | Qwen3.5 KV Cache | `--model X.om --tokenizer-dir /root/slm_deploy` |
 

@@ -10,7 +10,6 @@
 
 | 方案 | 上下文 | prefill | decode | OM 大小 |
 |------|--------|---------|--------|---------|
-| Qwen3 静态窗口 | 32 tok | — | 3.6 tok/s | 1.5 GB |
 | Qwen3 KV Cache | 256 tok | ~5.6s | 3.6 tok/s | 1.5 GB |
 | Qwen3.5 KV Cache | 256 tok | ~52s | 3.7 tok/s | 1.9 GB |
 | Qwen3.5 KV Cache | 1024 tok | ~67s | 3.6 tok/s | 1.9 GB |
@@ -35,15 +34,11 @@
 ```
 ├── model/                    # 模型权重 + tokenizer
 ├── scripts/                  # ONNX 导出 & ATC 转换 (x86 dev)
-│   ├── export_qwen3_static.py        # Qwen3 静态窗口导出
 │   ├── export_qwen3_kvcache.py     # Qwen3 KV Cache 导出
 │   ├── export_qwen35_kvcache.py      # Qwen3.5 DeltaNet KV Cache 导出
-│   ├── patch_qwen3_static_onnx.py         # GQA Expand→Tile 修补 (静态窗口专用)
 │   ├── gen_input_shape.py    # ONNX → ATC INPUT_SHAPE 辅助
 │   ├── podman_convert.sh     # 容器化 ATC 转换
-│   └── download_qwen3.py     # HF 模型下载
 ├── board/                    # 板端推理 (aarch64)
-│   ├── gen_text_qwen3_static.py     # 静态窗口推理
 │   ├── gen_text_qwen3_kvcache.py   # Qwen3 KV Cache 推理
 │   ├── gen_text_qwen35_kvcache.py    # Qwen3.5 DeltaNet KV Cache 推理
 │   └── run_qwen3_kvcache.sh
@@ -115,10 +110,7 @@ curl -L https://bootstrap.pypa.io/get-pip.py -o tmp/get-pip.py
 ### 2. 导出 ONNX → 编译 OM
 
 ```bash
-# 导出 ONNX（三选一，可自定义 --max-len）
-pixi run python scripts/export_qwen3_static.py \
-    --output om_out/qwen3_seq32.onnx
-
+# 导出 ONNX（可自定义 --max-len）
 pixi run python scripts/export_qwen3_kvcache.py --max-len 256 \
     --output om_out/qwen3_kvcache_max256.onnx
 
@@ -131,11 +123,6 @@ INPUT_SHAPE=$(pixi run python scripts/gen_input_shape.py om_out/qwen3.5_kvcache_
 export INPUT_SHAPE MODEL_ONNX="om_out/qwen3.5_kvcache_max256.onnx" OUTPUT_PREFIX="om_out/qwen3.5_kvcache_max256"
 bash scripts/podman_convert.sh
 ```
-
-> 静态窗口模型编译前需先运行 `patch_qwen3_static_onnx.py`（修复 GQA Expand 节点）：
-> ```bash
-> pixi run python scripts/patch_qwen3_static_onnx.py om_out/qwen3_seq32.onnx
-> ```
 
 可选参数：
 
@@ -244,11 +231,10 @@ python3 gen_text_qwen35_kvcache.py \
     --prompt "你好" --max-tokens 50
 ```
 
-三种推理脚本：
+两种推理脚本：
 
 | 脚本 | 对应模型 | 关键参数 |
 |------|---------|---------|
-| `gen_text_qwen3_static.py` | Qwen3 静态窗口 | `--prompt`, `--max-tokens` |
 | `gen_text_qwen3_kvcache.py` | Qwen3 KV Cache | `--model X.om --prompt` |
 | `gen_text_qwen35_kvcache.py` | Qwen3.5 KV Cache | `--model X.om --tokenizer-dir /root/slm_deploy` |
 
