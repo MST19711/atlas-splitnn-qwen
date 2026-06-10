@@ -130,7 +130,7 @@ On the board:
 
 ```bash
 cd /root/slm_deploy
-python3 wheels/get-pip.py --no-index --find-links=wheels pip
+python3 wheels/get-pip.py
 python3 -m pip install --no-index --find-links=wheels \
     "numpy==1.26.4" transformers torch
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
