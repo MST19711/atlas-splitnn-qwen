@@ -10,8 +10,8 @@ RUN dnf install -y python3 python3-pip which gcc-c++ && \
     dnf clean all
 
 # Copy CANN 7.0.0 installers
-COPY cann-toolkit-7.0.0.run /tmp/cann-toolkit.run
-COPY cann-kernels-310b-7.0.0.rpm /tmp/cann-kernels.rpm
+COPY Ascend-cann-toolkit_7.0.0_linux-x86_64.run /tmp/cann-toolkit.run
+COPY Ascend-cann-kernels-310b-7.0.0-linux.noarch.rpm /tmp/cann-kernels.rpm
 
 # 1) Install CANN 7.0.0 toolkit (.run installer)
 # 2) Install kernel RPM (places the kernel .run at /usr/local/Ascend/)
