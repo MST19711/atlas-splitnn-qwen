@@ -8,14 +8,20 @@ version = "0.1.0"
 
 [dependencies]
 python = "3.10.*"
-pytorch = ">=2.11.0,<3"
 transformers = ">=5.10.2,<6"
 onnx = ">=1.21.0,<2"
 onnxruntime = ">=1.26.0,<2"
 numpy = ">=2.2.6,<3"
 safetensors = ">=0.7.0,<0.8"
 huggingface_hub = ">=1.18.0,<2"
-accelerate = ">=1.13.0,<2"
+
+[pypi-options]
+extra-index-urls = ["https://download.pytorch.org/whl/cu128"]
 
 [pypi-dependencies]
+torch = "==2.11.0+cu128"
+accelerate = ">=1.13.0,<2"
 onnxsim = ">=0.6.4, <0.7"
+fastapi = ">=0.116.1,<0.117"
+uvicorn = ">=0.35.0,<0.36"
+pydantic = ">=2.11.7,<3"

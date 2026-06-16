@@ -41,9 +41,17 @@
 ├── board/                    # 板端推理 (aarch64)
 │   ├── gen_text_qwen3_kvcache.py   # Qwen3 KV Cache 推理
 │   ├── gen_text_qwen35_kvcache.py    # Qwen3.5 DeltaNet KV Cache 推理
+│   ├── gen_text_qwen35_splitnn.py    # Qwen3.5 SplitNN 推理（前4层+后4层）
 │   └── run_qwen3_kvcache.sh
+├── controller/               # SplitNN 控制器（OpenAI API + 可插拔前后段引擎）
+│   ├── openai_split_controller.py
+│   ├── orchestrator.py
+│   ├── remote_middle.py
+│   └── engine/
 ├── docker/                   # ATC 容器构建
 │   └── Containerfile.v2-cann7
+├── server/                   # CUDA 主机服务
+│   └── qwen35_split_service.py
 ├── om_out/                   # ATC 编译产物 (*.om)
 └── logs/                     # 编译日志
 ```
@@ -97,6 +105,14 @@ python3 -m pip download --dest tmp --platform any \
     --python-version 310 --only-binary=:all: --no-deps \
     "jinja2"
 
+# SplitNN 控制器额外依赖（板端 OpenAI API）
+mkdir -p tmp/board_controller_wheels
+python3 -m pip download --dest tmp/board_controller_wheels --platform manylinux2014_aarch64 \
+    --python-version 310 --implementation cp --abi cp310 --only-binary=:all: --no-deps \
+    "fastapi" "uvicorn" "pydantic" "pydantic-core" "starlette" \
+    "annotated-types" "typing-inspection" "anyio" "h11" "click" \
+    "sniffio" "exceptiongroup"
+
 # pip 自举：板端出厂无 pip，且板端 pip.conf 指向不可达的豆瓣镜像
 python3 -m pip download --dest tmp --platform manylinux2014_aarch64 \
     --python-version 310 --implementation cp --abi cp310 --only-binary=:all: --no-deps \
@@ -142,6 +158,9 @@ bash scripts/podman_convert.sh
 ```bash
 sshpass -p 'Mind@123' ssh root@192.168.137.100 'mkdir -p /root/slm_deploy/wheels'
 sshpass -p 'Mind@123' scp tmp/*.whl tmp/get-pip.py root@192.168.137.100:/root/slm_deploy/wheels/
+sshpass -p 'Mind@123' ssh root@192.168.137.100 'mkdir -p /root/slm_deploy/board_controller_wheels'
+sshpass -p 'Mind@123' scp tmp/board_controller_wheels/*.whl \
+    root@192.168.137.100:/root/slm_deploy/board_controller_wheels/
 ```
 
 #### 在开发板上安装
@@ -184,6 +203,16 @@ sed -i 's/tokenizers>=0.22.0,<=0.23.0/tokenizers>=0.22.0,<=0.23.1/' \
 # 7. 验证
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 python3 -c "import acl, numpy, transformers, tokenizers, huggingface_hub, safetensors, jinja2; print('OK')"
+
+# 8. SplitNN 控制器额外依赖
+cd /root/slm_deploy/board_controller_wheels
+python3 -m pip install --no-deps --no-index --find-links=. \
+    annotated_types-*.whl exceptiongroup-*.whl sniffio-*.whl anyio-*.whl \
+    click-*.whl h11-*.whl typing_inspection-*.whl pydantic_core-*.whl \
+    pydantic-*.whl starlette-*.whl uvicorn-*.whl fastapi-*.whl
+
+# 9. 控制器依赖验证
+python3 -c "import fastapi, uvicorn, pydantic; print('controller deps OK')"
 ```
 
 > **关于 `hf-xet`**：`huggingface-hub>=0.34` 在 aarch64 上依赖 `hf-xet>=1.1.3`，但 PyPI 上 `hf-xet` 仅 `0.1.x` 提供 aarch64 wheel。`hf-xet` 仅用于 HuggingFace Hub 并行下载，板端只通过 `from_pretrained(local_dir)` 读本地 tokenizer 文件，不会触发下载路径。
@@ -230,6 +259,285 @@ python3 gen_text_qwen35_kvcache.py \
     --model qwen3.5_kvcache_max256.om --tokenizer-dir /root/slm_deploy \
     --prompt "你好" --max-tokens 50
 ```
+
+## SplitNN 原型（板端 + CUDA 主机）
+
+首版 SplitNN 使用 `4 / 16 / 4` 切分：
+- 开发板运行前 4 层和后 4 层（两个 OM）
+- CUDA 主机运行中间 16 层（PyTorch）
+- 板端与主机通过 `HTTP/1.1 + application/octet-stream` 传输 `(1,1,1024)` 的 `fp16 hidden state`
+
+### 设计动机
+
+引入 SplitNN 的原因不是单纯为了“分布式”，而是为了把不同硬件各自擅长的部分拆开：
+
+- 开发板负责前后段，尽量贴近最终端侧部署形态
+- 主机负责中间 16 层的大部分计算量，减轻板端算力和内存压力
+- 两端之间只传输单步 hidden state，而不传完整 cache，从而把网络负担控制在每 token 约 4 KB 往返
+
+对 `Qwen3.5-0.8B` 而言，`4 / 16 / 4` 这个切分同时满足两个条件：
+
+1. **切分点落在层边界上**，不破坏残差和 cache 语义  
+2. **与 Qwen3.5 的 4 层周期结构对齐**：`3 个 linear_attention + 1 个 full_attention` 为一组，切成 `4 / 16 / 4` 后前段、中段、后段的层类型都保持完整
+
+### 系统职责划分
+
+SplitNN 原型中一共分成三部分：
+
+1. **前段（prefix）**
+   - 输入：`token_id + position + 前段 cache`
+   - 输出：`hidden_state_l4`
+   - 运行位置：开发板 OM 或开发机 ONNX
+
+2. **中段（middle）**
+   - 输入：`hidden_state_l4 + position + 中段 cache`
+   - 输出：`hidden_state_l20`
+   - 运行位置：主机 `server/qwen35_split_service.py`
+
+3. **后段（suffix）**
+   - 输入：`hidden_state_l20 + position + 后段 cache`
+   - 输出：`logits`
+   - 运行位置：开发板 OM 或开发机 ONNX
+
+其中：
+- **前后段 cache** 留在本地执行端
+- **中段 cache** 留在远端 server
+- 网络上传输的只有 `(1,1,1024)` 的 `fp16 hidden state`
+
+### 原型验证状态
+
+在引入控制器之前，原始 SplitNN 原型已经完成了三层验证：
+
+1. **纯 PyTorch reference 对齐**
+   - `prefix -> middle -> suffix`
+   - 与完整 `Qwen3.5 KV Cache` 模型逐 token 对齐
+
+2. **前后段 ONNX 多步 ORT 校验**
+   - 验证 prefix hidden 和 suffix logits 的数值正确性
+
+3. **本地模拟联调**
+   - `ONNX prefix/suffix + middle server`
+   - 已经可以按真实 prompt 生成并解码出正常中文文本
+
+因此，控制器并不是从零开始设计，而是建立在“SplitNN 原型本身已经可工作”的基础上。
+
+### 1. 导出前段 / 后段 ONNX
+
+```bash
+pixi run python scripts/export_qwen35_split_prefix.py \
+    --max-len 256 --output om_out/qwen3.5_split_prefix_max256.onnx
+
+pixi run python scripts/export_qwen35_split_suffix.py \
+    --max-len 256 --output om_out/qwen3.5_split_suffix_max256.onnx
+
+# 16K 长上下文版本
+pixi run python scripts/export_qwen35_split_prefix.py \
+    --max-len 16384 --output om_out/qwen3.5_split_prefix_max16384.onnx
+
+pixi run python scripts/export_qwen35_split_suffix.py \
+    --max-len 16384 --output om_out/qwen3.5_split_suffix_max16384.onnx
+```
+
+本地参考链路校验：
+
+```bash
+pixi run python scripts/validate_qwen35_split_reference.py
+```
+
+导出后 ORT 多步校验：
+
+```bash
+pixi run python scripts/validate_qwen35_split_ort.py \
+    --prefix-onnx om_out/qwen3.5_split_prefix_max256.onnx \
+    --suffix-onnx om_out/qwen3.5_split_suffix_max256.onnx
+```
+
+然后分别用现有 `scripts/gen_input_shape.py` + `scripts/podman_convert.sh` 编译成 `.om`。
+
+### 2. 启动 CUDA 主机服务
+
+```bash
+pixi run python server/qwen35_split_service.py \
+    --host 0.0.0.0 --port 18080 \
+    --model-path model/Qwen3.5-0.8B \
+    --device cuda:0 --max-len 16384
+```
+
+健康检查：
+
+```bash
+curl http://<server-ip>:18080/v1/health
+```
+
+### 3. 开发板运行 SplitNN
+
+将以下文件传到板端 `/root/slm_deploy/`：
+- `om_out/qwen3.5_split_prefix_max256.om`
+- `om_out/qwen3.5_split_suffix_max256.om`
+- `om_out/qwen3.5_split_prefix_max16384.om`
+- `om_out/qwen3.5_split_suffix_max16384.om`
+- `board/gen_text_qwen35_splitnn.py`
+- `board/run_qwen35_splitnn.sh`
+- `board/run_qwen35_splitnn_16k.sh`
+- `model/Qwen3.5-0.8B/tokenizer.json`
+- `model/Qwen3.5-0.8B/tokenizer_config.json`
+- `model/Qwen3.5-0.8B/chat_template.jinja`
+
+短上下文（256）运行：
+
+```bash
+python3 -u /root/slm_deploy/gen_text_qwen35_splitnn.py \
+    --server-url http://<server-ip>:18080 \
+    --prefix-model /root/slm_deploy/qwen3.5_split_prefix_max256.om \
+    --suffix-model /root/slm_deploy/qwen3.5_split_suffix_max256.om
+```
+
+长上下文（16K）运行：
+
+```bash
+cd /root/slm_deploy
+./run_qwen35_splitnn_16k.sh
+```
+
+> `run_qwen35_splitnn_16k.sh` 默认使用 `qwen3.5_split_prefix_max16384.om`、`qwen3.5_split_suffix_max16384.om` 和 `--max-len 16384`。
+
+## SplitNN 控制器（OpenAI API）
+
+在原始 SplitNN 原型之上，仓库额外提供了一个“控制器中间层”：
+- 对外提供 OpenAI 兼容的 `/v1/chat/completions`
+- 对内管理 tokenizer、chat template、采样、生成循环
+- 前后段通过统一引擎接口切换：
+  - `OnnxSplitEngine`：开发机仿真
+  - `OmSplitEngine`：开发板部署
+- 中间 16 层继续通过 `server/qwen35_split_service.py` 远端执行
+
+### 控制器架构
+
+```
+OpenAI Client
+    |
+    v
+controller/openai_split_controller.py
+    |
+    +-- orchestrator.py      # messages -> prompt -> prefill/decode -> OpenAI 响应
+    +-- remote_middle.py     # 与 middle server 的 open/step/close 协议
+    +-- engine/onnx_engine.py
+    `-- engine/om_engine.py
+```
+
+### 控制器特点
+
+- **无状态多轮**：每次请求都基于完整 `messages` 重新 prefill，不跨请求复用 cache
+- **前后段 cache**：由本地引擎实例内部管理
+- **中段 cache**：由远端 middle server 按 `session_id` 管理
+- **流式输出**：支持 `stream=true` 的 SSE 响应
+
+### 开发机启动（ONNX 后端）
+
+先启动 middle server：
+
+```bash
+pixi run python server/qwen35_split_service.py \
+    --host 127.0.0.1 --port 18080 \
+    --model-path model/Qwen3.5-0.8B \
+    --device cuda:0 --max-len 256
+```
+
+再启动控制器：
+
+```bash
+pixi run python controller/openai_split_controller.py \
+    --host 127.0.0.1 --port 8000 \
+    --engine onnx \
+    --model-name qwen3.5-split-4-16-4-onnx \
+    --remote-model-name Qwen3.5-0.8B-split-4-16-4 \
+    --tokenizer-dir model/Qwen3.5-0.8B \
+    --server-url http://127.0.0.1:18080 \
+    --max-len 256 \
+    --prefix-onnx om_out/qwen3.5_split_prefix_max256.onnx \
+    --suffix-onnx om_out/qwen3.5_split_suffix_max256.onnx
+```
+
+### 开发板启动（OM 后端）
+
+将以下文件同步到板端 `/root/slm_deploy/`：
+- `controller/`
+- `board/run_openai_split_controller_om.sh`
+- `board/run_openai_split_controller_om_16k.sh`
+- `om_out/qwen3.5_split_prefix_max256.om`
+- `om_out/qwen3.5_split_suffix_max256.om`
+- `om_out/qwen3.5_split_prefix_max16384.om`
+- `om_out/qwen3.5_split_suffix_max16384.om`
+- `model/Qwen3.5-0.8B/tokenizer.json`
+- `model/Qwen3.5-0.8B/tokenizer_config.json`
+- `model/Qwen3.5-0.8B/chat_template.jinja`
+
+如果开发板无法直接访问主机 `18080` 端口，可先在开发机建立反向隧道：
+
+```bash
+sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no -N \
+  -R 28080:127.0.0.1:18080 root@192.168.137.100
+```
+
+然后在板端启动控制器：
+
+```bash
+cd /root/slm_deploy
+./run_openai_split_controller_om.sh
+```
+
+16K 版本控制器：
+
+```bash
+cd /root/slm_deploy
+./run_openai_split_controller_om_16k.sh
+```
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:8000/healthz
+```
+
+非流式请求示例：
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3.5-split-4-16-4-onnx",
+    "messages": [{"role":"user","content":"你好，请用一句话介绍一下你自己。"}],
+    "stream": false,
+    "max_tokens": 24,
+    "temperature": 0
+  }'
+```
+
+流式请求示例：
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3.5-split-4-16-4-onnx",
+    "messages": [{"role":"user","content":"你好，请用一句话介绍一下你自己。"}],
+    "stream": true,
+    "max_tokens": 12,
+    "temperature": 0
+  }'
+```
+
+### 当前验证状态
+
+- `4 / 16 / 4` SplitNN 原型本身已通过 reference / ORT / 本地模拟三层验证
+- `prefix/suffix ONNX` 多步 ORT 校验通过
+- 本地 `ONNX 前后段 + middle server + OpenAI 控制器` 联调通过
+- 非流式与流式 OpenAI 请求均可返回正常中文文本
+- `OmSplitEngine` 已在开发板上完成非流式真实联调，能够连续处理多次请求并返回可解码中文文本
+- `max_len=16384` 的 CUDA middle server 已完成实际测速，单 token 中段吞吐约 `9 tok/s`
+- `max16384` 的 prefix/suffix ONNX 已导出并通过 ORT 校验，prefix/suffix `.om` 也已编译完成
+- 开发板 16K OM 控制器已完成真实联调，能够处理明显超过 `256 token` 的长 prompt，并成功返回文本（示例响应为 `收到。`）
+- 开发板 OM 后端的 SSE 流式收尾仍待继续排查，当前建议优先使用非流式接口做板端联调
 
 两种推理脚本：
 
