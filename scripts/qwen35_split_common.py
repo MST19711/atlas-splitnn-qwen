@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Qwen3.5 SplitNN shared helpers.
+"""Qwen3.5 SplitNN shared helpers (torch-side — x86 only).
 
 Shared by:
 - ONNX export wrappers for prefix/suffix
 - CUDA middle-segment service
+
+Imports ModelSpec/SplitConfig/metadata from qwen35_model_spec (no torch dep).
 """
 
 from __future__ import annotations
@@ -19,32 +21,28 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     torch_recurrent_gated_delta_rule,
 )
 
-MAX_LEN = 16384
-FULL_NL_DN = 18
-FULL_NL_GA = 6
-K_H = 16
-K_DIM = 128
-V_DIM = 128
-KV_H = 2
-HDIM = 256
-CONV_D = 6144
-CONV_KS = 4
-HIDDEN_SIZE = 1024
-VOCAB_SIZE = 248320
+# The server and export scripts add scripts/ to sys.path, 
+# so this same-directory import works in all contexts.
+from qwen35_model_spec import (
+    ModelSpec,
+    SplitConfig,
+    export_metadata,
+    load_metadata,
+)
 
-PREFIX_START = 0
-PREFIX_END = 4
-MIDDLE_START = 4
-MIDDLE_END = 20
-SUFFIX_START = 20
-SUFFIX_END = 24
-
-PREFIX_NL_DN = 3
-PREFIX_NL_GA = 1
-MIDDLE_NL_DN = 12
-MIDDLE_NL_GA = 4
-SUFFIX_NL_DN = 3
-SUFFIX_NL_GA = 1
+__all__ = [
+    "ModelSpec",
+    "SplitConfig",
+    "export_metadata",
+    "load_metadata",
+    "apply_qwen35_patches",
+    "configure_eager_attention",
+    "build_segment_io_names",
+    "SegmentRunner",
+    "PrefixWrapper",
+    "MiddleWrapper",
+    "SuffixWrapper",
+]
 
 _PATCHED = False
 
@@ -131,11 +129,14 @@ def apply_qwen35_patches() -> None:
 
         beta = b.sigmoid()
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        if self.num_v_heads // self.num_k_heads > 1:
+            q = q.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+            k = k.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         if past_S is None:
             past_S = torch.zeros(
                 batch,
-                self.num_k_heads,
+                self.num_v_heads,
                 self.head_k_dim,
                 self.head_v_dim,
                 dtype=v.dtype,
@@ -262,13 +263,13 @@ def build_segment_io_names(
 
 
 class SegmentRunner(nn.Module):
-    def __init__(self, text_model, start: int, end: int, max_len: int, nl_dn: int, nl_ga: int):
+    def __init__(self, text_model, model_spec: ModelSpec, start: int, end: int, max_len: int):
         super().__init__()
         self.model = text_model
         self.layers = nn.ModuleList(list(text_model.layers[start:end]))
         self.max_len = max_len
-        self.nl_dn = nl_dn
-        self.nl_ga = nl_ga
+        self.model_spec = model_spec
+        self.nl_dn, self.nl_ga = model_spec.compute_segment(start, end)
 
     def _forward_layers(self, hidden: torch.Tensor, position: torch.Tensor, cache_flat):
         attn_mask = make_attn_mask(self.max_len, position)
@@ -343,8 +344,9 @@ class _AttentionCacheWrapper:
 
 
 class PrefixWrapper(SegmentRunner):
-    def __init__(self, text_model, max_len: int):
-        super().__init__(text_model, PREFIX_START, PREFIX_END, max_len, PREFIX_NL_DN, PREFIX_NL_GA)
+    def __init__(self, text_model, model_spec: ModelSpec, split_config: SplitConfig, max_len: int):
+        start, end = split_config.prefix_range
+        super().__init__(text_model, model_spec, start, end, max_len)
 
     def forward(self, input_ids, position, *cache_flat):
         hidden = self.model.embed_tokens(input_ids)
@@ -353,8 +355,9 @@ class PrefixWrapper(SegmentRunner):
 
 
 class MiddleWrapper(SegmentRunner):
-    def __init__(self, text_model, max_len: int):
-        super().__init__(text_model, MIDDLE_START, MIDDLE_END, max_len, MIDDLE_NL_DN, MIDDLE_NL_GA)
+    def __init__(self, text_model, model_spec: ModelSpec, split_config: SplitConfig, max_len: int):
+        start, end = split_config.middle_range
+        super().__init__(text_model, model_spec, start, end, max_len)
 
     def forward(self, hidden_states, position, *cache_flat):
         hidden, pres_s, pres_c, pres_k, pres_v = self._forward_layers(hidden_states, position, cache_flat)
@@ -362,8 +365,9 @@ class MiddleWrapper(SegmentRunner):
 
 
 class SuffixWrapper(SegmentRunner):
-    def __init__(self, text_model, max_len: int, lm_head):
-        super().__init__(text_model, SUFFIX_START, SUFFIX_END, max_len, SUFFIX_NL_DN, SUFFIX_NL_GA)
+    def __init__(self, text_model, model_spec: ModelSpec, split_config: SplitConfig, max_len: int, lm_head):
+        start, end = split_config.suffix_range
+        super().__init__(text_model, model_spec, start, end, max_len)
         self.lm_head = lm_head
 
     def forward(self, hidden_states, position, *cache_flat):

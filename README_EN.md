@@ -8,11 +8,14 @@ Deploy Qwen3-0.6B and Qwen3.5-0.8B small language models on the Huawei Ascend At
 
 ## Results
 
-| Model | Context | Prefill | Decode | OM Size |
-|-------|---------|---------|--------|---------|
-| Qwen3 KV Cache | 256 tok | ~5.6s | 3.6 tok/s | 1.5 GB |
-| Qwen3.5 KV Cache | 256 tok | ~52s | 3.7 tok/s | 1.9 GB |
-| Qwen3.5 KV Cache | 1024 tok | ~67s | 3.6 tok/s | 1.9 GB |
+| Model | Context | OM Size |
+|-------|---------|---------|
+| Qwen3 KV Cache (0.6B) | 256 tok | 1.5 GB |
+| Qwen3.5 KV Cache (0.8B) | 256 tok | 1.9 GB |
+| Qwen3.5 KV Cache (0.8B) | 1024 tok | 1.9 GB |
+| **Qwen3.5 SplitNN (4B, 1/30/1)** | **16K tok** | **Prefix+Suffix ~2.8 GB** |
+
+> SplitNN 4B inference validated on dev machine (ONNX backend). Board OM deployment pending ATC compilation.
 
 ---
 
@@ -21,7 +24,7 @@ Deploy Qwen3-0.6B and Qwen3.5-0.8B small language models on the Huawei Ascend At
 | Component | Description |
 |-----------|-------------|
 | Board | Atlas 200I DK A2 (Ascend310B4, 4GB NPU) |
-| Models | Qwen3-0.6B / Qwen3.5-0.8B (FP16) |
+| Models | Qwen3-0.6B / Qwen3.5-0.8B / Qwen3.5-4B (FP16) |
 | CANN | 7.0.0 (ATC container) / 7.0.RC1 (board runtime) |
 | ONNX | opset 15, TorchScript export |
 | Container | Podman + Rocky Linux 9, image `cann-atc-rocky:v7` |
@@ -34,24 +37,31 @@ Deploy Qwen3-0.6B and Qwen3.5-0.8B small language models on the Huawei Ascend At
 ```
 ├── model/                    # Model weights + tokenizer
 ├── scripts/                  # ONNX export & ATC conversion (x86)
-│   ├── export_qwen3_kvcache.py     # Qwen3 KV Cache export
-│   ├── export_qwen35_kvcache.py      # Qwen3.5 DeltaNet KV Cache export
-│   ├── gen_input_shape.py    # ONNX → ATC INPUT_SHAPE helper
-│   ├── podman_convert.sh     # Containerized ATC conversion
+│   ├── qwen35_model_spec.py       # ModelSpec/SplitConfig (no torch dep)
+│   ├── qwen35_split_common.py     # SplitNN shared code (Wrappers + Patches)
+│   ├── export_qwen35_split_prefix.py   # Prefix ONNX export (supports --split)
+│   ├── export_qwen35_split_suffix.py   # Suffix ONNX export (supports --split)
+│   ├── export_qwen3_kvcache.py         # Qwen3 KV Cache export
+│   ├── export_qwen35_kvcache.py        # Qwen3.5 DeltaNet KV Cache export
+│   ├── gen_input_shape.py        # ONNX → ATC INPUT_SHAPE helper
+│   ├── podman_convert.sh         # Containerized ATC conversion
 ├── board/                    # On-board inference (aarch64)
-│   ├── gen_text_qwen3_kvcache.py   # Qwen3 KV Cache inference
-│   ├── gen_text_qwen35_kvcache.py    # Qwen3.5 DeltaNet inference
+│   ├── gen_text_qwen3_kvcache.py       # Qwen3 KV Cache inference
+│   ├── gen_text_qwen35_kvcache.py      # Qwen3.5 DeltaNet inference
+│   ├── gen_text_qwen35_splitnn.py      # SplitNN inference (uses OmSplitEngine)
 │   └── run_qwen3_kvcache.sh
 ├── controller/               # SplitNN controller (OpenAI API + pluggable front/back engines)
-│   ├── openai_split_controller.py
-│   ├── orchestrator.py
-│   ├── remote_middle.py
+│   ├── openai_split_controller.py   # FastAPI entry
+│   ├── orchestrator.py              # Messages → prompt → prefill/decode
+│   ├── remote_middle.py             # Middle server HTTP protocol
+│   ├── schemas.py                   # Pydantic models (incl. enable_thinking)
 │   └── engine/
-├── docker/                   # ATC container build
-│   └── Containerfile.v2-cann7
+│       ├── base.py                  # Abstract engine
+│       ├── onnx_engine.py           # ONNX Runtime engine
+│       └── om_engine.py             # OM (NPU) engine
 ├── server/                   # Remote middle-segment service
-│   └── qwen35_split_service.py
-├── om_out/                   # ATC output (*.om)
+│   └── qwen35_split_service.py      # HTTP service (supports --split)
+├── om_out/                   # ATC output (*.om, *.onnx)
 └── logs/                     # Build logs
 ```
 
@@ -266,12 +276,40 @@ Inference scripts:
 
 ---
 
+## Generalized SplitNN Architecture
+
+The SplitNN system has been generalized from hardcoded `4/16/4` to a **parameterized architecture** supporting:
+
+- **Any Qwen3.5 model size** (0.8B / 2B / 4B / 9B / 27B)
+- **Custom context lengths** (256 / 16K / arbitrary)
+- **Custom split schemes** via `--split prefix_end,suffix_start`
+- **Thinking toggle** (`enable_thinking` parameter)
+
+### Core Components
+
+| Component | Path | Purpose |
+|-----------|------|---------|
+| `ModelSpec` | `scripts/qwen35_model_spec.py` | Reads architecture params from `config.json` dynamically |
+| `SplitConfig` | `scripts/qwen35_model_spec.py` | Parameterized split; auto-computes DN/GA layer counts |
+| `metadata.json` | Exported alongside ONNX | Board-side model params without PyTorch |
+
+### Using `--split`
+
+```bash
+# 0.8B classic 4/16/4 (default)
+pixi run python scripts/export_qwen35_split_prefix.py --split 4,20 --max-len 256
+
+# 4B model, 1 layer per edge (optimal for board memory)
+pixi run python scripts/export_qwen35_split_prefix.py \
+  --model-path model_dl/Qwen3.5-4B --split 1,31 --max-len 16384
+```
+
 ## SplitNN Prototype (Board + CUDA Host)
 
-The first SplitNN prototype uses a `4 / 16 / 4` split:
-- board executes the first 4 layers and last 4 layers
-- host executes the middle 16 layers
-- the two sides exchange only `(1,1,1024)` FP16 hidden states over HTTP
+The initial SplitNN prototype used a `4 / 16 / 4` split for Qwen3.5-0.8B, now generalized:
+- board executes front/back segments
+- CUDA host executes middle segment
+- only `(1,1,hidden_size)` FP16 hidden states cross the network over HTTP
 
 ### Why this split
 
@@ -432,110 +470,125 @@ controller/openai_split_controller.py
 - **Prefix/suffix cache:** owned by the local engine instance
 - **Middle cache:** owned by the remote middle server, keyed by `session_id`
 - **Streaming:** supports `stream=true` via SSE
+- **Thinking toggle:** `enable_thinking` parameter passed to chat template
+- **Flexible split:** `--split` / `--model-path` adapt to any model size
 
 ### Start on Dev Machine (ONNX backend)
 
 Start the middle service first:
 
 ```bash
+# 4B 1/30/1 long context
 pixi run python server/qwen35_split_service.py \
     --host 127.0.0.1 --port 18080 \
-    --model-path model/Qwen3.5-0.8B \
-    --device cuda:0 --max-len 16384
+    --model-path model_dl/Qwen3.5-4B \
+    --split 1,31 --device cuda:0 --max-len 16384
 ```
 
 Then start the controller:
 
 ```bash
+# 4B 1/30/1 + 16K ONNX backend
 pixi run python controller/openai_split_controller.py \
     --host 127.0.0.1 --port 8000 \
     --engine onnx \
-    --model-name qwen3.5-split-4-16-4-onnx \
-    --remote-model-name Qwen3.5-0.8B-split-4-16-4 \
-    --tokenizer-dir model/Qwen3.5-0.8B \
+    --model-path model_dl/Qwen3.5-4B \
+    --model-name qwen3.5-4b-split-1-30-1-onnx \
+    --remote-model-name "Qwen3.5-2560B-split-1-30-1" \
+    --split 1,31 --max-len 16384 \
     --server-url http://127.0.0.1:18080 \
-    --max-len 256 \
-    --prefix-onnx om_out/qwen3.5_split_prefix_max256.onnx \
-    --suffix-onnx om_out/qwen3.5_split_suffix_max256.onnx
+    --prefix-onnx om_out/qwen3.5_4b_split_prefix_max16384.onnx \
+    --suffix-onnx om_out/qwen3.5_4b_split_suffix_max16384.onnx
 ```
 
 ### Start on the Board (OM backend)
 
-Copy the following files to `/root/slm_deploy/` on the board:
-- `controller/`
-- `board/run_openai_split_controller_om.sh`
-- `board/run_openai_split_controller_om_16k.sh`
-- `om_out/qwen3.5_split_prefix_max256.om`
-- `om_out/qwen3.5_split_suffix_max256.om`
-- `om_out/qwen3.5_split_prefix_max16384.om`
-- `om_out/qwen3.5_split_suffix_max16384.om`
-- `model/Qwen3.5-0.8B/tokenizer.json`
-- `model/Qwen3.5-0.8B/tokenizer_config.json`
-- `model/Qwen3.5-0.8B/chat_template.jinja`
+#### Board File Layout
 
-If the board cannot directly reach the host's `18080` port, create a reverse tunnel from the dev machine first:
+The board directory `/root/slm_deploy/` must follow this structure for correct module imports:
+
+```
+/root/slm_deploy/
+├── gen_text_qwen35_splitnn.py     # Inference entry (standalone)
+├── scripts/                        # Python package (requires __init__.py)
+│   ├── __init__.py
+│   └── qwen35_model_spec.py       # ModelSpec/SplitConfig/load_metadata
+├── controller/
+│   ├── __init__.py
+│   └── engine/
+│       ├── __init__.py
+│       ├── base.py                 # SplitEngine abstract base
+│       └── om_engine.py            # OmSplitEngine (ACL NPU inference)
+├── qwen3.5_split_prefix_max256.om
+├── qwen3.5_split_prefix_max256.metadata.json
+├── qwen3.5_split_suffix_max256.om
+├── qwen3.5_split_suffix_max256.metadata.json
+├── tokenizer.json
+├── tokenizer_config.json
+└── chat_template.jinja
+```
+
+**Import chain:**
+- `gen_text_qwen35_splitnn.py` → `qwen35_model_spec.load_metadata()` → reads `.metadata.json` (no PyTorch)
+- `gen_text_qwen35_splitnn.py` → `controller.engine.om_engine.OmSplitEngine` → manages OM via ACL
+- `controller/engine/base.py` → `scripts.qwen35_model_spec.ModelSpec`
+
+**Note:** `scripts/`, `controller/`, and `controller/engine/` all need `__init__.py` (can be empty).
+
+#### File Transfer
 
 ```bash
+# Core code
+sshpass -p 'Mind@123' scp board/gen_text_qwen35_splitnn.py \
+    root@192.168.137.100:/root/slm_deploy/
+sshpass -p 'Mind@123' scp scripts/qwen35_model_spec.py \
+    root@192.168.137.100:/root/slm_deploy/scripts/
+sshpass -p 'Mind@123' scp controller/__init__.py \
+    root@192.168.137.100:/root/slm_deploy/controller/
+sshpass -p 'Mind@123' scp controller/engine/{__init__.py,base.py,om_engine.py} \
+    root@192.168.137.100:/root/slm_deploy/controller/engine/
+
+# OM models + metadata
+sshpass -p 'Mind@123' scp om_out/qwen3.5_split_prefix_max256.{om,metadata.json} \
+    root@192.168.137.100:/root/slm_deploy/
+sshpass -p 'Mind@123' scp om_out/qwen3.5_split_suffix_max256.{om,metadata.json} \
+    root@192.168.137.100:/root/slm_deploy/
+
+# Tokenizer
+sshpass -p 'Mind@123' scp model/Qwen3.5-0.8B/{tokenizer.json,tokenizer_config.json,chat_template.jinja} \
+    root@192.168.137.100:/root/slm_deploy/
+```
+
+#### SSH Tunnel & Run
+
+If the board cannot reach the host's `18080` port directly:
+
+```bash
+# On dev machine — forward board:28080 → localhost:18080
 sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no -N \
-  -R 28080:127.0.0.1:18080 root@192.168.137.100
+  -R 28080:127.0.0.1:18080 root@192.168.137.100 &
 ```
 
-Then start the controller on the board:
+Run on the board:
 
 ```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
 cd /root/slm_deploy
-./run_openai_split_controller_om.sh
-```
-
-16K controller variant:
-
-```bash
-cd /root/slm_deploy
-./run_openai_split_controller_om_16k.sh
-```
-
-Health check:
-
-```bash
-curl http://127.0.0.1:8000/healthz
-```
-
-Non-streaming example:
-
-```bash
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "qwen3.5-split-4-16-4-onnx",
-    "messages": [{"role":"user","content":"Hello, introduce yourself in one sentence."}],
-    "stream": false,
-    "max_tokens": 24,
-    "temperature": 0
-  }'
-```
-
-Streaming example:
-
-```bash
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "qwen3.5-split-4-16-4-onnx",
-    "messages": [{"role":"user","content":"Hello, introduce yourself in one sentence."}],
-    "stream": true,
-    "max_tokens": 12,
-    "temperature": 0
-  }'
+python3 gen_text_qwen35_splitnn.py \
+    --server-url http://127.0.0.1:28080 \
+    --prefix-model /root/slm_deploy/qwen3.5_split_prefix_max256.om \
+    --suffix-model /root/slm_deploy/qwen3.5_split_suffix_max256.om \
+    --tokenizer-dir /root/slm_deploy \
+    --prompt "Hello" --max-tokens 50
 ```
 
 ### Validation Status
 
-- the raw `4 / 16 / 4` SplitNN prototype already passed reference / ORT / local simulation validation
-- multi-step ORT validation for prefix/suffix passed
-- local integration of `ONNX prefix/suffix + middle server + OpenAI controller` passed
-- both non-streaming and streaming OpenAI requests returned valid Chinese text
-- `OmSplitEngine` has now been validated on the real Atlas board for non-streaming requests, including consecutive requests with cache reset between sessions
-- the CUDA middle service has been extended to `max_len=16384` and benchmarked at about `9 tok/s` for the middle segment
-- `max16384` prefix/suffix ONNX export passed ORT validation, and the corresponding `.om` models were compiled successfully
-- the real board-side 16K OM controller completed a long-prompt test well beyond `256` tokens and returned decoded text successfully (example response: `收到。`)
-- SSE streaming on the board-side OM backend still needs follow-up debugging, so non-streaming is the recommended path for current on-board testing
+- raw `4 / 16 / 4` SplitNN prototype passed reference / ORT / local simulation validation
+- **SplitNN generalization completed:** `ModelSpec` + `SplitConfig` support arbitrary model sizes and split schemes
+- **4B model 1/30/1 split 16K context** local ONNX integration passed (all modes)
+- **Board-host cooperative test passed:** board OM(prefix+suffix) + host CUDA(middle) via SSH tunnel
+  - Prefill: 13 tok / 3.8s (295 ms/tok); Decode: 1.8 tok/s
+  - Thinking mode works correctly
+- **Board script** refactored to reuse `OmSplitEngine` via `metadata.json`
+- CUDA middle service benchmarked at ~9 tok/s for middle segment

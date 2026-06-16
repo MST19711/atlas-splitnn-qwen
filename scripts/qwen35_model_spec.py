@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Lightweight model spec and split config — no torch/transformers dependency.
+
+Imported by both the x86 dev side and the Atlas board (aarch64, no PyTorch).
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+# ── Model Specification ────────────────────────────────────────────────
+
+
+@dataclass
+class ModelSpec:
+    """All architecture parameters read from model config.json."""
+
+    hidden_size: int
+    vocab_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    intermediate_size: int
+    linear_num_key_heads: int
+    linear_num_value_heads: int
+    linear_key_head_dim: int
+    linear_value_head_dim: int
+    linear_conv_kernel_dim: int
+    full_attention_interval: int
+    layer_types: list[str] = field(repr=False)
+
+    @classmethod
+    def from_pretrained(cls, model_path: str) -> "ModelSpec":
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        if hasattr(config, "text_config"):
+            tc = config.text_config
+        else:
+            tc = config
+
+        layer_types = []
+        interval = getattr(tc, "full_attention_interval", 4)
+        for i in range(tc.num_hidden_layers):
+            if (i + 1) % interval == 0:
+                layer_types.append("full_attention")
+            else:
+                layer_types.append("linear_attention")
+
+        return cls(
+            hidden_size=tc.hidden_size,
+            vocab_size=tc.vocab_size,
+            num_hidden_layers=tc.num_hidden_layers,
+            num_attention_heads=tc.num_attention_heads,
+            num_key_value_heads=tc.num_key_value_heads,
+            head_dim=tc.head_dim,
+            intermediate_size=tc.intermediate_size,
+            linear_num_key_heads=tc.linear_num_key_heads,
+            linear_num_value_heads=tc.linear_num_value_heads,
+            linear_key_head_dim=tc.linear_key_head_dim,
+            linear_value_head_dim=tc.linear_value_head_dim,
+            linear_conv_kernel_dim=tc.linear_conv_kernel_dim,
+            full_attention_interval=interval,
+            layer_types=layer_types,
+        )
+
+    @property
+    def conv_dim(self) -> int:
+        """Dimension of the DeltaNet conv1d input (q+k+v concatenated)."""
+        return (
+            self.linear_num_key_heads * self.linear_key_head_dim
+            + self.linear_num_key_heads * self.linear_key_head_dim
+            + self.linear_num_value_heads * self.linear_value_head_dim
+        )
+
+    def compute_segment(self, start: int, end: int) -> tuple[int, int]:
+        """Return (nl_dn, nl_ga) for layer range [start, end)."""
+        nl_dn = sum(1 for i in range(start, end) if self.layer_types[i] == "linear_attention")
+        nl_ga = sum(1 for i in range(start, end) if self.layer_types[i] == "full_attention")
+        return nl_dn, nl_ga
+
+    def to_dict(self) -> dict:
+        return {
+            "hidden_size": self.hidden_size,
+            "vocab_size": self.vocab_size,
+            "num_hidden_layers": self.num_hidden_layers,
+            "num_attention_heads": self.num_attention_heads,
+            "num_key_value_heads": self.num_key_value_heads,
+            "head_dim": self.head_dim,
+            "intermediate_size": self.intermediate_size,
+            "linear_num_key_heads": self.linear_num_key_heads,
+            "linear_num_value_heads": self.linear_num_value_heads,
+            "linear_key_head_dim": self.linear_key_head_dim,
+            "linear_value_head_dim": self.linear_value_head_dim,
+            "linear_conv_kernel_dim": self.linear_conv_kernel_dim,
+            "full_attention_interval": self.full_attention_interval,
+            "conv_dim": self.conv_dim,
+            "layer_types": self.layer_types,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ModelSpec":
+        return cls(
+            hidden_size=d["hidden_size"],
+            vocab_size=d["vocab_size"],
+            num_hidden_layers=d["num_hidden_layers"],
+            num_attention_heads=d["num_attention_heads"],
+            num_key_value_heads=d["num_key_value_heads"],
+            head_dim=d["head_dim"],
+            intermediate_size=d["intermediate_size"],
+            linear_num_key_heads=d["linear_num_key_heads"],
+            linear_num_value_heads=d["linear_num_value_heads"],
+            linear_key_head_dim=d["linear_key_head_dim"],
+            linear_value_head_dim=d["linear_value_head_dim"],
+            linear_conv_kernel_dim=d["linear_conv_kernel_dim"],
+            full_attention_interval=d["full_attention_interval"],
+            layer_types=d["layer_types"],
+        )
+
+
+# ── Split Configuration ────────────────────────────────────────────────
+
+
+@dataclass
+class SplitConfig:
+    """Defines the layer split boundaries for Prefix / Middle / Suffix."""
+
+    prefix_end: int
+    suffix_start: int
+    total_layers: int
+
+    @classmethod
+    def create(cls, prefix_layers: int, suffix_layers: int, total_layers: int) -> "SplitConfig":
+        return cls(
+            prefix_end=prefix_layers,
+            suffix_start=total_layers - suffix_layers,
+            total_layers=total_layers,
+        )
+
+    @property
+    def prefix_range(self) -> tuple[int, int]:
+        return (0, self.prefix_end)
+
+    @property
+    def middle_range(self) -> tuple[int, int]:
+        return (self.prefix_end, self.suffix_start)
+
+    @property
+    def suffix_range(self) -> tuple[int, int]:
+        return (self.suffix_start, self.total_layers)
+
+    def to_dict(self) -> dict:
+        return {
+            "prefix_end": self.prefix_end,
+            "suffix_start": self.suffix_start,
+            "total_layers": self.total_layers,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SplitConfig":
+        return cls(
+            prefix_end=d["prefix_end"],
+            suffix_start=d["suffix_start"],
+            total_layers=d["total_layers"],
+        )
+
+
+# ── Metadata helpers ────────────────────────────────────────────────────
+
+
+def export_metadata(
+    model_spec: ModelSpec,
+    split_config: SplitConfig,
+    segment: str,
+    output_path: str,
+) -> None:
+    """Write a metadata.json alongside the ONNX model for board-side consumption."""
+    start, end = split_config.prefix_range if segment == "prefix" else split_config.suffix_range
+    nl_dn, nl_ga = model_spec.compute_segment(start, end)
+    meta = {
+        "model_spec": model_spec.to_dict(),
+        "split_config": split_config.to_dict(),
+        "segment": segment,
+        "nl_dn": nl_dn,
+        "nl_ga": nl_ga,
+    }
+    meta_path = str(Path(output_path).with_suffix(".metadata.json"))
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"metadata: {meta_path}")
+
+
+def load_metadata(meta_path: str) -> tuple[ModelSpec, SplitConfig, int, int]:
+    """Load metadata.json (no PyTorch needed — safe for board)."""
+    with open(meta_path) as f:
+        meta = json.load(f)
+    model_spec = ModelSpec.from_dict(meta["model_spec"])
+    split_config = SplitConfig.from_dict(meta["split_config"])
+    return model_spec, split_config, meta["nl_dn"], meta["nl_ga"]

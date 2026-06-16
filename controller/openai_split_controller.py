@@ -6,6 +6,9 @@ import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from qwen35_model_spec import ModelSpec, SplitConfig
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastapi import FastAPI, HTTPException
@@ -16,39 +19,60 @@ from controller.remote_middle import RemoteMiddleClient, RemoteMiddleError
 from controller.schemas import ChatCompletionRequest, ErrorBody, ErrorEnvelope, ModelCard, ModelListResponse
 
 RUNNER: SplitChatCompletionRunner | None = None
-ENGINE: SplitEngine | None = None
 
 
-def _make_engine(args) -> SplitEngine:
-    if args.engine == "onnx":
-        from controller.engine.onnx_engine import OnnxSplitEngine
+def parse_split(value: str) -> tuple[int, int]:
+    parts = value.split(",")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("split must be 'prefix_end,suffix_start', e.g. '4,20'")
+    return int(parts[0]), int(parts[1])
 
-        if not args.prefix_onnx or not args.suffix_onnx:
-            raise ValueError("onnx engine requires --prefix-onnx and --suffix-onnx")
-        return OnnxSplitEngine(
-            model_id=args.model_name,
-            max_len=args.max_len,
-            prefix_onnx=args.prefix_onnx,
-            suffix_onnx=args.suffix_onnx,
-        )
-    from controller.engine.om_engine import OmSplitEngine
 
-    if not args.prefix_om or not args.suffix_om:
-        raise ValueError("om engine requires --prefix-om and --suffix-om")
-    return OmSplitEngine(
-        model_id=args.model_name,
-        max_len=args.max_len,
-        prefix_om=args.prefix_om,
-        suffix_om=args.suffix_om,
-    )
+def _make_model_name(model_spec: ModelSpec, split: tuple[int, int], engine: str) -> str:
+    hs = model_spec.hidden_size
+    size_str = f"{hs // 1024 if hs % 1024 == 0 else hs}B" if hs >= 1024 else str(hs)
+    prefix_ct = split[0]
+    suffix_ct = model_spec.num_hidden_layers - split[1]
+    middle_ct = split[1] - split[0]
+    return f"qwen3.5-{size_str}-split-{prefix_ct}-{middle_ct}-{suffix_ct}-{engine}"
 
 
 def build_app(args) -> FastAPI:
-    global RUNNER, ENGINE
-    ENGINE = _make_engine(args)
+    global RUNNER
+
+    model_spec = ModelSpec.from_pretrained(args.model_path)
+    split_config = SplitConfig(args.split[0], args.split[1], model_spec.num_hidden_layers)
+    model_name = args.model_name or _make_model_name(model_spec, args.split, args.engine)
+
+    if args.engine == "onnx":
+        from controller.engine.onnx_engine import OnnxSplitEngine
+        if not args.prefix_onnx or not args.suffix_onnx:
+            raise ValueError("onnx engine requires --prefix-onnx and --suffix-onnx")
+        engine = OnnxSplitEngine(
+            model_id=model_name,
+            max_len=args.max_len,
+            model_spec=model_spec,
+            split_config=split_config,
+            prefix_onnx=args.prefix_onnx,
+            suffix_onnx=args.suffix_onnx,
+        )
+    else:
+        from controller.engine.om_engine import OmSplitEngine
+        if not args.prefix_om or not args.suffix_om:
+            raise ValueError("om engine requires --prefix-om and --suffix-om")
+        engine = OmSplitEngine(
+            model_id=model_name,
+            max_len=args.max_len,
+            model_spec=model_spec,
+            split_config=split_config,
+            prefix_om=args.prefix_om,
+            suffix_om=args.suffix_om,
+        )
+
     remote = RemoteMiddleClient(
         server_url=args.server_url,
-        model_name=args.remote_model_name,
+        model_name=args.remote_model_name or model_name,
+        hidden_size=model_spec.hidden_size,
         max_len=args.max_len,
         connect_timeout=args.connect_timeout,
         read_timeout=args.read_timeout,
@@ -58,17 +82,16 @@ def build_app(args) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         global RUNNER
-        ENGINE.load()
+        engine.load()
         RUNNER = SplitChatCompletionRunner(
-            engine=ENGINE,
+            engine=engine,
             remote_middle=remote,
             tokenizer_dir=args.tokenizer_dir,
             max_len=args.max_len,
-            model_name=args.model_name,
+            model_name=model_name,
         )
         yield
-        if ENGINE is not None:
-            ENGINE.close()
+        engine.close()
 
     app = FastAPI(lifespan=lifespan)
 
@@ -84,23 +107,25 @@ def build_app(args) -> FastAPI:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return {
             "ok": True,
-            "model": args.model_name,
+            "model": model_name,
             "engine": args.engine,
+            "hidden_size": model_spec.hidden_size,
             "remote": remote_health,
         }
 
     @app.get("/v1/models")
     async def list_models():
-        return ModelListResponse(data=[ModelCard(id=args.model_name)])
+        return ModelListResponse(data=[ModelCard(id=model_name)])
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatCompletionRequest):
-        if request.model != args.model_name:
+        if request.model != model_name:
             return _error_response(400, f"unsupported model: {request.model}", "BAD_MODEL")
         assert RUNNER is not None
         try:
             if request.stream:
-                return StreamingResponse(RUNNER.run_stream(request), media_type="text/event-stream")
+                return StreamingResponse(RUNNER.run_stream(request),
+                                         media_type="text/event-stream")
             response = RUNNER.run_non_stream(request)
             return JSONResponse(content=response.model_dump())
         except (RemoteMiddleError, OrchestratorError) as exc:
@@ -116,11 +141,14 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--engine", choices=["onnx", "om"], default="onnx")
-    parser.add_argument("--model-name", default="qwen3.5-split-4-16-4-onnx")
-    parser.add_argument("--remote-model-name", default="Qwen3.5-0.8B-split-4-16-4")
+    parser.add_argument("--model-name", default="")
+    parser.add_argument("--remote-model-name", default="")
+    parser.add_argument("--model-path", default="model/Qwen3.5-0.8B")
     parser.add_argument("--tokenizer-dir", default="model/Qwen3.5-0.8B")
     parser.add_argument("--server-url", default="http://127.0.0.1:18080")
     parser.add_argument("--max-len", type=int, default=256)
+    parser.add_argument("--split", type=parse_split, default=(4, 20),
+                        help="prefix_end,suffix_start  (e.g. 4,20 for 4/16/4)")
     parser.add_argument("--prefix-onnx")
     parser.add_argument("--suffix-onnx")
     parser.add_argument("--prefix-om")

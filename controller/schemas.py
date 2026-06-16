@@ -23,6 +23,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = 0.7
     top_k: int = Field(default=40, ge=0, le=512)
     stop: str | list[str] | None = None
+    enable_thinking: bool = False
 
 
 class ChatMessageResponse(BaseModel):

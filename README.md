@@ -8,11 +8,14 @@
 
 ## 成果概览
 
-| 方案 | 上下文 | prefill | decode | OM 大小 |
-|------|--------|---------|--------|---------|
-| Qwen3 KV Cache | 256 tok | ~5.6s | 3.6 tok/s | 1.5 GB |
-| Qwen3.5 KV Cache | 256 tok | ~52s | 3.7 tok/s | 1.9 GB |
-| Qwen3.5 KV Cache | 1024 tok | ~67s | 3.6 tok/s | 1.9 GB |
+| 方案 | 模型 | 上下文 | OM 大小 |
+|------|------|--------|---------|
+| Qwen3 KV Cache | Qwen3-0.6B | 256 tok | 1.5 GB |
+| Qwen3.5 KV Cache | Qwen3.5-0.8B | 256 tok | 1.9 GB |
+| Qwen3.5 KV Cache | Qwen3.5-0.8B | 1024 tok | 1.9 GB |
+| **Qwen3.5 SplitNN** | **Qwen3.5-4B (1/30/1)** | **16K tok** | **Prefix+Suffix ~2.8 GB** |
+
+> SplitNN 方案在开发机 ONNX 后端已联调通过，4B 模型 16K 上下文可稳定推理。板端 OM 部署待 ATC 编译后实测。
 
 ---
 
@@ -21,7 +24,7 @@
 | 组件 | 说明 |
 |------|------|
 | 开发板 | Atlas 200I DK A2 (Ascend310B4, 4GB NPU) |
-| 模型 | Qwen3-0.6B / Qwen3.5-0.8B (FP16) |
+| 模型 | Qwen3-0.6B / Qwen3.5-0.8B / Qwen3.5-4B (FP16) |
 | CANN | 7.0.0 (ATC 编译容器) / 7.0.RC1 (板端 runtime) |
 | ONNX | opset 15, TorchScript 导出 |
 | 容器 | Podman + Rocky Linux 9, 镜像 `cann-atc-rocky:v7` |
@@ -34,25 +37,33 @@
 ```
 ├── model/                    # 模型权重 + tokenizer
 ├── scripts/                  # ONNX 导出 & ATC 转换 (x86 dev)
-│   ├── export_qwen3_kvcache.py     # Qwen3 KV Cache 导出
-│   ├── export_qwen35_kvcache.py      # Qwen3.5 DeltaNet KV Cache 导出
-│   ├── gen_input_shape.py    # ONNX → ATC INPUT_SHAPE 辅助
-│   ├── podman_convert.sh     # 容器化 ATC 转换
+│   ├── qwen35_model_spec.py       # ModelSpec/SplitConfig (无 torch 依赖)
+│   ├── qwen35_split_common.py     # SplitNN 共享代码（Wrappers + Patches）
+│   ├── export_qwen35_split_prefix.py   # Prefix ONNX 导出（支持 --split）
+│   ├── export_qwen35_split_suffix.py   # Suffix ONNX 导出（支持 --split）
+│   ├── export_qwen3_kvcache.py         # Qwen3 KV Cache 导出
+│   ├── export_qwen35_kvcache.py          # Qwen3.5 DeltaNet KV Cache 导出
+│   ├── gen_input_shape.py        # ONNX → ATC INPUT_SHAPE 辅助
+│   ├── podman_convert.sh         # 容器化 ATC 转换
 ├── board/                    # 板端推理 (aarch64)
-│   ├── gen_text_qwen3_kvcache.py   # Qwen3 KV Cache 推理
-│   ├── gen_text_qwen35_kvcache.py    # Qwen3.5 DeltaNet KV Cache 推理
-│   ├── gen_text_qwen35_splitnn.py    # Qwen3.5 SplitNN 推理（前4层+后4层）
+│   ├── gen_text_qwen3_kvcache.py       # Qwen3 KV Cache 推理
+│   ├── gen_text_qwen35_kvcache.py        # Qwen3.5 DeltaNet KV Cache 推理
+│   ├── gen_text_qwen35_splitnn.py        # Qwen3.5 SplitNN 推理（复用 OmSplitEngine）
 │   └── run_qwen3_kvcache.sh
 ├── controller/               # SplitNN 控制器（OpenAI API + 可插拔前后段引擎）
-│   ├── openai_split_controller.py
-│   ├── orchestrator.py
-│   ├── remote_middle.py
+│   ├── openai_split_controller.py   # FastAPI 入口
+│   ├── orchestrator.py              # 消息编排、采样、生成循环
+│   ├── remote_middle.py             # 与远端中段服务的 HTTP 协议
+│   ├── schemas.py                   # Pydantic 数据模型 (含 enable_thinking)
 │   └── engine/
+│       ├── base.py                  # 引擎抽象基类
+│       ├── onnx_engine.py           # ONNX Runtime 引擎
+│       └── om_engine.py             # OM (NPU) 引擎
 ├── docker/                   # ATC 容器构建
 │   └── Containerfile.v2-cann7
 ├── server/                   # CUDA 主机服务
-│   └── qwen35_split_service.py
-├── om_out/                   # ATC 编译产物 (*.om)
+│   └── qwen35_split_service.py      # 中段 HTTP 服务（支持 --split）
+├── om_out/                   # ATC 编译产物 (*.om, *.onnx)
 └── logs/                     # 编译日志
 ```
 
@@ -260,49 +271,74 @@ python3 gen_text_qwen35_kvcache.py \
     --prompt "你好" --max-tokens 50
 ```
 
+## SplitNN 通用化架构
+
+SplitNN 体系现已从硬编码的 `4/16/4` 切分演进为**参数化架构**，支持：
+
+- **任意 Qwen3.5 模型尺寸**（0.8B / 2B / 4B / 9B / 27B）
+- **自定义上下文长度**（256 / 16K / 任意）
+- **自定义切分方案**（通过 `--split prefix_end,suffix_start` 指定）
+- **Thinking 开关**（`enable_thinking` 选项透传至 chat template）
+
+### 核心组件
+
+| 组件 | 路径 | 作用 |
+|------|------|------|
+| `ModelSpec` | `scripts/qwen35_model_spec.py` | 从 `config.json` 动态读取所有架构参数 |
+| `SplitConfig` | `scripts/qwen35_model_spec.py` | 切分点参数化，自动计算各段 DN/GA 层数 |
+| `metadata.json` | 导出时附带 | 板端无 PyTorch，通过 JSON 获取模型参数 |
+
+### 使用 `--split`
+
+```bash
+# 0.8B 经典 4/16/4 切分（默认）
+pixi run python scripts/export_qwen35_split_prefix.py --split 4,20 --max-len 256
+
+# 4B 模型，前后各 1 层（板端内存最优）
+pixi run python scripts/export_qwen35_split_prefix.py \
+  --model-path model_dl/Qwen3.5-4B --split 1,31 --max-len 16384
+```
+
 ## SplitNN 原型（板端 + CUDA 主机）
 
-首版 SplitNN 使用 `4 / 16 / 4` 切分：
-- 开发板运行前 4 层和后 4 层（两个 OM）
-- CUDA 主机运行中间 16 层（PyTorch）
-- 板端与主机通过 `HTTP/1.1 + application/octet-stream` 传输 `(1,1,1024)` 的 `fp16 hidden state`
+首版 SplitNN 使用 `4 / 16 / 4` 切分（Qwen3.5-0.8B），现扩展为通用参数化体系：
+- 开发板运行前段和后段（两个 OM 或 ONNX）
+- CUDA 主机运行中间段（PyTorch）
+- 板端与主机通过 `HTTP/1.1 + application/octet-stream` 传输 `(1,1,hidden_size)` 的 `fp16 hidden state`
 
 ### 设计动机
 
-引入 SplitNN 的原因不是单纯为了“分布式”，而是为了把不同硬件各自擅长的部分拆开：
+引入 SplitNN 的原因不是单纯为了"分布式"，而是为了把不同硬件各自擅长的部分拆开：
 
 - 开发板负责前后段，尽量贴近最终端侧部署形态
-- 主机负责中间 16 层的大部分计算量，减轻板端算力和内存压力
-- 两端之间只传输单步 hidden state，而不传完整 cache，从而把网络负担控制在每 token 约 4 KB 往返
+- 主机负责中间段的大部分计算量，减轻板端算力和内存压力
+- 两端之间只传输单步 hidden state，而不传完整 cache，从而把网络负担控制在每 token 约 `hidden_size × 2` 字节往返
 
-对 `Qwen3.5-0.8B` 而言，`4 / 16 / 4` 这个切分同时满足两个条件：
-
-1. **切分点落在层边界上**，不破坏残差和 cache 语义  
-2. **与 Qwen3.5 的 4 层周期结构对齐**：`3 个 linear_attention + 1 个 full_attention` 为一组，切成 `4 / 16 / 4` 后前段、中段、后段的层类型都保持完整
+对 Qwen3.5 而言，`full_attention_interval=4` 的周期结构使得切分可以灵活选择边界——`4 / 16 / 4`（0.8B 经典）、`1 / 30 / 1`（4B 内存最优）等多种方案均可。
 
 ### 系统职责划分
 
-SplitNN 原型中一共分成三部分：
+SplitNN 中一共分成三部分：
 
 1. **前段（prefix）**
    - 输入：`token_id + position + 前段 cache`
-   - 输出：`hidden_state_l4`
+   - 输出：`hidden_state`
    - 运行位置：开发板 OM 或开发机 ONNX
 
 2. **中段（middle）**
-   - 输入：`hidden_state_l4 + position + 中段 cache`
-   - 输出：`hidden_state_l20`
+   - 输入：`hidden_state + position + 中段 cache`
+   - 输出：`hidden_state`
    - 运行位置：主机 `server/qwen35_split_service.py`
 
 3. **后段（suffix）**
-   - 输入：`hidden_state_l20 + position + 后段 cache`
+   - 输入：`hidden_state + position + 后段 cache`
    - 输出：`logits`
    - 运行位置：开发板 OM 或开发机 ONNX
 
 其中：
 - **前后段 cache** 留在本地执行端
 - **中段 cache** 留在远端 server
-- 网络上传输的只有 `(1,1,1024)` 的 `fp16 hidden state`
+- 网络上传输的只有 `(1, 1, hidden_size)` 的 `fp16 hidden state`
 
 ### 原型验证状态
 
@@ -324,18 +360,21 @@ SplitNN 原型中一共分成三部分：
 ### 1. 导出前段 / 后段 ONNX
 
 ```bash
+# 0.8B 经典 4/16/4 切分（默认）
 pixi run python scripts/export_qwen35_split_prefix.py \
     --max-len 256 --output om_out/qwen3.5_split_prefix_max256.onnx
 
 pixi run python scripts/export_qwen35_split_suffix.py \
     --max-len 256 --output om_out/qwen3.5_split_suffix_max256.onnx
 
-# 16K 长上下文版本
+# 4B 模型 1/30/1 切分 + 16K 上下文
 pixi run python scripts/export_qwen35_split_prefix.py \
-    --max-len 16384 --output om_out/qwen3.5_split_prefix_max16384.onnx
+    --model-path model_dl/Qwen3.5-4B --split 1,31 --max-len 16384 \
+    --output om_out/qwen3.5_4b_split_prefix_max16384.onnx
 
 pixi run python scripts/export_qwen35_split_suffix.py \
-    --max-len 16384 --output om_out/qwen3.5_split_suffix_max16384.onnx
+    --model-path model_dl/Qwen3.5-4B --split 1,31 --max-len 16384 \
+    --output om_out/qwen3.5_4b_split_suffix_max16384.onnx
 ```
 
 本地参考链路校验：
@@ -357,10 +396,17 @@ pixi run python scripts/validate_qwen35_split_ort.py \
 ### 2. 启动 CUDA 主机服务
 
 ```bash
+# 0.8B 经典 4/16/4
 pixi run python server/qwen35_split_service.py \
     --host 0.0.0.0 --port 18080 \
     --model-path model/Qwen3.5-0.8B \
     --device cuda:0 --max-len 16384
+
+# 4B 1/30/1 切分 + 16K 上下文
+pixi run python server/qwen35_split_service.py \
+    --host 0.0.0.0 --port 18080 \
+    --model-path model_dl/Qwen3.5-4B \
+    --split 1,31 --device cuda:0 --max-len 16384
 ```
 
 健康检查：
@@ -431,112 +477,141 @@ controller/openai_split_controller.py
 - **前后段 cache**：由本地引擎实例内部管理
 - **中段 cache**：由远端 middle server 按 `session_id` 管理
 - **流式输出**：支持 `stream=true` 的 SSE 响应
+- **Thinking 开关**：支持 `enable_thinking` 参数控制思考模式
+- **灵活切分**：通过 `--split` / `--model-path` 适配不同模型尺寸和切分方案
 
 ### 开发机启动（ONNX 后端）
 
 先启动 middle server：
 
 ```bash
+# 4B 1/30/1 长上下文
 pixi run python server/qwen35_split_service.py \
     --host 127.0.0.1 --port 18080 \
-    --model-path model/Qwen3.5-0.8B \
-    --device cuda:0 --max-len 256
+    --model-path model_dl/Qwen3.5-4B \
+    --split 1,31 --device cuda:0 --max-len 16384
 ```
 
 再启动控制器：
 
 ```bash
+# 4B 1/30/1 + 16K ONNX 后端
 pixi run python controller/openai_split_controller.py \
     --host 127.0.0.1 --port 8000 \
     --engine onnx \
-    --model-name qwen3.5-split-4-16-4-onnx \
-    --remote-model-name Qwen3.5-0.8B-split-4-16-4 \
-    --tokenizer-dir model/Qwen3.5-0.8B \
+    --model-path model_dl/Qwen3.5-4B \
+    --model-name qwen3.5-4b-split-1-30-1-onnx \
+    --remote-model-name "Qwen3.5-2560B-split-1-30-1" \
+    --split 1,31 --max-len 16384 \
     --server-url http://127.0.0.1:18080 \
-    --max-len 256 \
-    --prefix-onnx om_out/qwen3.5_split_prefix_max256.onnx \
-    --suffix-onnx om_out/qwen3.5_split_suffix_max256.onnx
+    --prefix-onnx om_out/qwen3.5_4b_split_prefix_max16384.onnx \
+    --suffix-onnx om_out/qwen3.5_4b_split_suffix_max16384.onnx
 ```
 
 ### 开发板启动（OM 后端）
 
-将以下文件同步到板端 `/root/slm_deploy/`：
-- `controller/`
-- `board/run_openai_split_controller_om.sh`
-- `board/run_openai_split_controller_om_16k.sh`
-- `om_out/qwen3.5_split_prefix_max256.om`
-- `om_out/qwen3.5_split_suffix_max256.om`
-- `om_out/qwen3.5_split_prefix_max16384.om`
-- `om_out/qwen3.5_split_suffix_max16384.om`
-- `model/Qwen3.5-0.8B/tokenizer.json`
-- `model/Qwen3.5-0.8B/tokenizer_config.json`
-- `model/Qwen3.5-0.8B/chat_template.jinja`
+#### 板端文件布局
 
-如果开发板无法直接访问主机 `18080` 端口，可先在开发机建立反向隧道：
+板端 `/root/slm_deploy/` 需按以下结构组织，确保模块间相互引用正确：
+
+```
+/root/slm_deploy/
+├── gen_text_qwen35_splitnn.py     # 板端推理入口（独立脚本）
+├── scripts/                        # Python 包（需 __init__.py）
+│   ├── __init__.py
+│   └── qwen35_model_spec.py       # ModelSpec/SplitConfig/load_metadata
+├── controller/
+│   ├── __init__.py
+│   └── engine/
+│       ├── __init__.py
+│       ├── base.py                 # SplitEngine 抽象基类
+│       └── om_engine.py            # OmSplitEngine（ACL NPU 推理）
+├── qwen3.5_split_prefix_max256.om         # OM 模型文件
+├── qwen3.5_split_prefix_max256.metadata.json   # 配套元数据
+├── qwen3.5_split_suffix_max256.om
+├── qwen3.5_split_suffix_max256.metadata.json
+├── tokenizer.json                 # Qwen3.5 tokenizer（与 Qwen3 不兼容）
+├── tokenizer_config.json
+└── chat_template.jinja
+```
+
+**关键引用链：**
+- `gen_text_qwen35_splitnn.py` → `qwen35_model_spec.load_metadata()` → 从 `.metadata.json` 读取模型参数（无需 PyTorch）
+- `gen_text_qwen35_splitnn.py` → `controller.engine.om_engine.OmSplitEngine` → ACL 管理 .om 文件
+- `controller/engine/base.py` → `scripts.qwen35_model_spec.ModelSpec`（需 `scripts/__init__.py`）
+
+**注意：**
+- `scripts/`、`controller/`、`controller/engine/` 都必须有 `__init__.py`（可为空文件），否则 Python 包导入失败
+- `.metadata.json` 文件名需与对应 `.om` 前缀一致（如 `qwen3.5_split_prefix_max256.om` → `...metadata.json`）
+- 首次运行前需 `source /usr/local/Ascend/ascend-toolkit/set_env.sh` 加载 ACL 环境
+
+#### 传输文件
 
 ```bash
+# 核心代码
+sshpass -p 'Mind@123' scp board/gen_text_qwen35_splitnn.py \
+    root@192.168.137.100:/root/slm_deploy/
+sshpass -p 'Mind@123' scp scripts/qwen35_model_spec.py \
+    root@192.168.137.100:/root/slm_deploy/scripts/
+sshpass -p 'Mind@123' scp controller/__init__.py \
+    root@192.168.137.100:/root/slm_deploy/controller/
+sshpass -p 'Mind@123' scp controller/engine/{__init__.py,base.py,om_engine.py} \
+    root@192.168.137.100:/root/slm_deploy/controller/engine/
+
+# OM 模型 + 元数据
+sshpass -p 'Mind@123' scp om_out/qwen3.5_split_prefix_max256.om \
+    root@192.168.137.100:/root/slm_deploy/
+sshpass -p 'Mind@123' scp om_out/qwen3.5_split_prefix_max256.metadata.json \
+    root@192.168.137.100:/root/slm_deploy/
+sshpass -p 'Mind@123' scp om_out/qwen3.5_split_suffix_max256.om \
+    root@192.168.137.100:/root/slm_deploy/
+sshpass -p 'Mind@123' scp om_out/qwen3.5_split_suffix_max256.metadata.json \
+    root@192.168.137.100:/root/slm_deploy/
+
+# Tokenizer
+sshpass -p 'Mind@123' scp model/Qwen3.5-0.8B/{tokenizer.json,tokenizer_config.json,chat_template.jinja} \
+    root@192.168.137.100:/root/slm_deploy/
+```
+
+#### 建立网络隧道并运行
+
+如果开发板无法直接访问主机 `18080` 端口，先在开发机建立反向隧道：
+
+```bash
+# 开发机执行（将板端 28080 转发到本机 18080）
 sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no -N \
-  -R 28080:127.0.0.1:18080 root@192.168.137.100
+  -R 28080:127.0.0.1:18080 root@192.168.137.100 &
 ```
 
-然后在板端启动控制器：
+板端运行（通过隧道 `127.0.0.1:28080` 访问中间服务）：
 
 ```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
 cd /root/slm_deploy
-./run_openai_split_controller_om.sh
-```
-
-16K 版本控制器：
-
-```bash
-cd /root/slm_deploy
-./run_openai_split_controller_om_16k.sh
-```
-
-健康检查：
-
-```bash
-curl http://127.0.0.1:8000/healthz
-```
-
-非流式请求示例：
-
-```bash
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "qwen3.5-split-4-16-4-onnx",
-    "messages": [{"role":"user","content":"你好，请用一句话介绍一下你自己。"}],
-    "stream": false,
-    "max_tokens": 24,
-    "temperature": 0
-  }'
-```
-
-流式请求示例：
-
-```bash
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "qwen3.5-split-4-16-4-onnx",
-    "messages": [{"role":"user","content":"你好，请用一句话介绍一下你自己。"}],
-    "stream": true,
-    "max_tokens": 12,
-    "temperature": 0
-  }'
+python3 gen_text_qwen35_splitnn.py \
+    --server-url http://127.0.0.1:28080 \
+    --prefix-model /root/slm_deploy/qwen3.5_split_prefix_max256.om \
+    --suffix-model /root/slm_deploy/qwen3.5_split_suffix_max256.om \
+    --tokenizer-dir /root/slm_deploy \
+    --prompt "你好" --max-tokens 50
 ```
 
 ### 当前验证状态
 
 - `4 / 16 / 4` SplitNN 原型本身已通过 reference / ORT / 本地模拟三层验证
-- `prefix/suffix ONNX` 多步 ORT 校验通过
-- 本地 `ONNX 前后段 + middle server + OpenAI 控制器` 联调通过
-- 非流式与流式 OpenAI 请求均可返回正常中文文本
-- `OmSplitEngine` 已在开发板上完成非流式真实联调，能够连续处理多次请求并返回可解码中文文本
+- **SplitNN 通用化完成**：通过 `ModelSpec` + `SplitConfig` 支持任意模型尺寸和切分方案
+- **4B 模型 1/30/1 切分 16K 上下文**本地 ONNX 联调通过（非流式 + 流式 + 多轮 + thinking）
+- **端边协同实测数据**：
+
+| 模型 | 切分 | 上下文 | Prefill | Decode | 验证项 |
+|------|------|--------|---------|--------|--------|
+| Qwen3.5-0.8B | 4/16/4 | 256 | 13 tok / 3.8s | 1.8 tok/s | 短问答 + thinking |
+| **Qwen3.5-4B** | **1/30/1** | **16K** | **13 tok / 63s** | **0.3 tok/s** | 短问答 |
+| **Qwen3.5-4B** | **1/30/1** | **16K** | **319 tok** (超 256) | — | 长上下文 ✓ |
+
+- 4B 16K 长上下文实测：319 token prompt 正确返回 "收到。"，证明端边 16K 推理能力
+- **板端脚本**已重构为复用 `OmSplitEngine`，通过 `metadata.json` 获取模型参数
 - `max_len=16384` 的 CUDA middle server 已完成实际测速，单 token 中段吞吐约 `9 tok/s`
-- `max16384` 的 prefix/suffix ONNX 已导出并通过 ORT 校验，prefix/suffix `.om` 也已编译完成
-- 开发板 16K OM 控制器已完成真实联调，能够处理明显超过 `256 token` 的长 prompt，并成功返回文本（示例响应为 `收到。`）
 - 开发板 OM 后端的 SSE 流式收尾仍待继续排查，当前建议优先使用非流式接口做板端联调
 
 两种推理脚本：

@@ -13,6 +13,7 @@
 5. [阶段四：SplitNN 原型设计](#阶段四splitnn-原型设计)
 6. [阶段五：SplitNN 控制器与 OpenAI 接口](#阶段五splitnn-控制器与-openai-接口)
 7. [解决的关键工程问题](#解决的关键工程问题)
+8. [阶段六：SplitNN 通用化](#阶段六splitnn-通用化)
 
 ---
 
@@ -785,6 +786,200 @@ Board OM prefix/suffix
 4. **开发板 OM 后端的非流式路径已经实机验证通过，但 SSE 流式收尾仍待继续排查**
 
 不过从工程阶段来看，至此 SplitNN 已经进入“部署联调”而不再只是“算子验证”阶段。
+
+---
+
+## 阶段六：SplitNN 通用化
+
+SplitNN 体系在 `4 / 16 / 4` 原型验证成功之后，下一步自然是将硬编码的参数化，使其能适配不同模型尺寸、不同上下文长度和不同切分方案。
+
+### 设计目标
+
+1. **支持任意 Qwen3.5 模型尺寸**（0.8B / 2B / 4B / 9B / 27B）
+2. **支持自定义切分方案**（`--split prefix_end,suffix_start`）
+3. **支持自定义上下文长度**（`--max-len`）
+4. **支持 thinking 开关**（`enable_thinking`）
+
+### 核心抽象
+
+#### ModelSpec
+
+从 `config.json` 动态读取所有架构参数，替代硬编码常量：
+
+```python
+@dataclass
+class ModelSpec:
+    hidden_size: int          # 1024 / 2048 / 2560 / 4096 / 5120
+    vocab_size: int           # 248320
+    num_hidden_layers: int    # 24 / 24 / 32 / 32 / 64
+    num_key_value_heads: int  # 2 / 2 / 4 / 4 / 4
+    head_dim: int             # 256 (所有尺寸)
+    linear_num_key_heads: int # 16 (所有尺寸)
+    linear_num_value_heads: int  # 16 / 16 / 32 / 32 / 48
+    linear_key_head_dim: int  # 128
+    linear_value_head_dim: int # 128
+    layer_types: list[str]    # 从 full_attention_interval=4 自动生成
+```
+
+关键派生量：
+- `conv_dim`: `K_H × K_DIM × 2 + V_H × V_DIM`（随模型尺寸变化：6144 / 6144 / 8192 / 8192 / 10240）
+- `compute_segment(start, end) → (nl_dn, nl_ga)`: 统计区间内 DN/GA 层数
+
+#### SplitConfig
+
+```python
+@dataclass
+class SplitConfig:
+    prefix_end: int     # prefix 层范围 [0, prefix_end)
+    suffix_start: int   # suffix 层范围 [suffix_start, total)
+```
+
+从切分点自动计算各段 nl_dn/nl_ga。
+
+#### 零依赖设计
+
+为使板端脚本能导入 `ModelSpec`/`SplitConfig`（板端无 PyTorch），将这些数据结构拆分到独立的 `scripts/qwen35_model_spec.py`，零外部依赖。x86 侧的 `scripts/qwen35_split_common.py` 导入它们并补充 torch 相关逻辑。
+
+### 4B 模型的适配修复
+
+Qwen3.5-4B（32 层，hidden_size=2560）在 SplitNN 导出的首个测试中暴露了两个与 0.8B 不同的架构特征：
+
+#### 1. DeltaNet K/V head 不匹配
+
+Qwen3.5-4B 的 DeltaNet 层中：
+- `linear_num_key_heads` = 16（K heads）
+- `linear_num_value_heads` = 32（V heads）
+
+而 0.8B 中两者均为 16。原生 `Qwen3_5GatedDeltaNet.forward` 通过 `repeat_interleave` 将 q/k 的 head 数从 16 扩展到 32，以匹配 v/g/beta：
+
+```python
+if self.num_v_heads // self.num_k_heads > 1:
+    query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+    key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+```
+
+我们的 monkey-patch `_patched_dn_fwd` 漏掉了这一步，导致 `torch_recurrent_gated_delta_rule` 内部 K head 数（16）与 V/g head 数（32）不匹配。修复：在 patch 中追加 `repeat_interleave`。
+
+#### 2. S-state 维度错误
+
+S-state（DeltaNet recurrent state）的正确 shape 为 `(1, num_v_heads, head_k_dim, head_v_dim)`。导出脚本和缓存构造代码错误地使用了 `num_k_heads` 作为第一维。对于 0.8B 这无意中正确（K=V=16），但对 4B（K=16, V=32）导致越界。修复：统一使用 `linear_num_value_heads` 创建 S-state。
+
+### 测试验证
+
+#### 0.8B 向后兼容（4/16/4）
+
+- ONNX 导出：PASS（checker + ORT 校验通过）
+- 参考链路：SplitNN v.s. 完整 KVCache，max_diff=0.000000
+- 控制端到端：非流式 / 流式 / 多轮 / thinking 均通过
+
+#### 4B 长上下文（1/30/1, 16K）
+
+| 测试项 | 结果 |
+|--------|------|
+| ONNX 导出 | PASS（prefix 1427.9 MB, suffix 1417.9 MB） |
+| ORT 校验 | prefix max_diff=0.000244, suffix max_diff=0.000000 |
+| 短问题 | "你好，我是 Qwen3.5，阿里巴巴最新推出的通义千问" |
+| 长上下文 | 正确从重复 prompt 中提取核心信息 |
+| 流式 SSE | "1 + 1 等于 **2**" |
+| 多轮对话 | 正确记住用户名 |
+| Thinking | 输出思考过程 |
+
+#### 切分灵活性验证
+
+`--split` 参数可以任意指定切分边界：
+
+```bash
+# 0.8B: 4/16/4（默认）
+--split 4,20
+
+# 4B: 1/30/1（板端内存最优）
+--split 1,31
+
+# 0.8B: 8/8/8（均衡示例）
+--split 8,16
+```
+
+### 端边协同实测
+
+在 SplitNN 通用化完成后，进行了两轮端边协同推理测试：
+
+**第一轮 — 0.8B 模型初步验证 (4/16/4, 256)：**
+
+| 模式 | Prefill | Decode | 输出 |
+|------|---------|--------|------|
+| 普通 | 3.8s (13 tok, 295 ms/tok) | 1.8 tok/s | "你好！很高兴见到你。有什么我可以帮你的吗？" |
+| Thinking | 5.1s (20 tok, 257 ms/tok) | 2.4 tok/s | "Thinking Process: 1. Analyze the Request..." |
+
+**第二轮 — 4B 模型长上下文 (1/30/1, 16K)：**
+
+| 测试项 | 结果 |
+|--------|------|
+| 短问答 | "你好！有什么我可以帮你的吗？..." |
+| Prefill (13 tok) | 63.4s (4.9s/tok) |
+| Decode 速度 | 0.3 tok/s |
+| 长上下文 (319 tok) | 正确返回 "收到。" |
+| 16K 能力验证 | 成功处理远超 256 token 的 prompt |
+
+**硬件配置：**
+- 开发板：Atlas 200I DK A2 (Ascend310B4, 4GB NPU) — OM 前后段
+- 主机：x86_64 + RTX 5070 Ti (16GB) — CUDA PyTorch 中段
+- 协议：每步 (1,1,hidden_size) FP16 = 2048/5120 bytes over SSH reverse tunnel
+
+**性能瓶颈分析：**
+- 4B 解码速度（0.3 tok/s）显著慢于 0.8B（1.8 tok/s），主因是 prefix 段每个 token 需完成完整的 ACL model execute（包含 NPU 任务下发、等待、数据搬移）
+- 中段 CUDA 服务单 token 约 110ms（9 tok/s），不是瓶颈
+- prefix 段每个 token 在板端约需 4-5 秒，是主导延迟
+
+### 板端文件布局（重要）
+
+为使板端 Python 包正确相互引用，`/root/slm_deploy/` 必须包含 `__init__.py` 并按如下结构组织：
+
+```
+/root/slm_deploy/
+├── gen_text_qwen35_splitnn.py     # 入口脚本
+├── scripts/                        # Python 包
+│   ├── __init__.py                 # 必须（可为空文件）
+│   └── qwen35_model_spec.py       # ModelSpec/SplitConfig/load_metadata
+├── controller/
+│   ├── __init__.py                 # 必须
+│   └── engine/
+│       ├── __init__.py             # 必须
+│       ├── base.py                 # SplitEngine ABC
+│       └── om_engine.py            # OmSplitEngine (ACL 管理)
+├── *.om                            # OM 模型文件
+├── *.metadata.json                 # 配套元数据（与 OM 同名前缀）
+├── tokenizer.json
+├── tokenizer_config.json
+└── chat_template.jinja
+```
+
+**为何需要 `__init__.py`：** `controller/engine/base.py` 使用 `from scripts.qwen35_model_spec import ModelSpec` 包导入方式。若 `scripts/` 目录无 `__init__.py`，Python 不将其作为包看待，导入失败。
+
+**metadata.json 命名规则：** 与 `.om` 文件同名前缀。如 `qwen3.5_split_prefix_max256.om` 对应 `.metadata.json`。脚本通过 `Path(om_path).with_suffix(".metadata.json")` 自动查找。
+
+### 架构变更总结
+
+| 变更 | 影响文件 |
+|------|---------|
+| `ModelSpec` / `SplitConfig` | `scripts/qwen35_model_spec.py`（新增） |
+| `SegmentRunner` 参数化 | `scripts/qwen35_split_common.py` |
+| DeltaNet K/V head 修复 | `scripts/qwen35_split_common.py` |
+| 导出脚本支持 `--split` | `export_qwen35_split_prefix.py`, `suffix.py` |
+| 服务端支持 `--split` | `server/qwen35_split_service.py` |
+| 控制器支持 `--split --model-path` | `controller/openai_split_controller.py` |
+| 引擎参数化 | `controller/engine/onnx_engine.py`, `om_engine.py` |
+| 协议动态 hidden_size | `controller/remote_middle.py` |
+| Thinking 开关 | `controller/schemas.py`, `orchestrator.py` |
+| 板端复用 OmSplitEngine | `board/gen_text_qwen35_splitnn.py` |
+| OM 引擎条件 position | `controller/engine/om_engine.py` (`nl_ga > 0`) |
+| metadata.json 机制 | `scripts/qwen35_model_spec.py` |
+
+### 当前局限
+
+1. **板端 decode 速度慢**：4B 模型 0.3 tok/s，主要瓶颈在板端 NPU 的 prefix/suffix 执行延迟
+2. **板端 SSE 流式未修复**：板端 OM 后端 SSE 流式收尾问题仍然存在
+3. **全模型 KVCache 未更新**：`export_qwen35_kvcache.py` 仍使用硬编码的 0.8B 常量，暂不适用于 4B
+4. **OM 模型不含 position 输入时的适配**：已通过 `nl_ga > 0` 条件判断修复（仅 GQA 层需要 position）
 
 ## 解决的关键工程问题
 

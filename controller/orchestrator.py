@@ -10,7 +10,10 @@ from transformers import AutoTokenizer
 
 from controller.engine.base import SplitEngine
 from controller.remote_middle import RemoteMiddleClient
-from controller.schemas import ChatCompletionRequest, ChatCompletionResponse, ChatChoice, ChatCompletionChunk, ChatMessageResponse, StreamChoice, StreamDelta
+from controller.schemas import (
+    ChatCompletionRequest, ChatCompletionResponse, ChatChoice,
+    ChatCompletionChunk, ChatMessageResponse, StreamChoice, StreamDelta,
+)
 
 
 class OrchestratorError(RuntimeError):
@@ -65,12 +68,13 @@ class SplitChatCompletionRunner:
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True)
 
     def _format_messages(self, request: ChatCompletionRequest) -> str:
-        msgs = [{"role": m.role, "content": _normalize_message_content(m.content)} for m in request.messages]
+        msgs = [{"role": m.role, "content": _normalize_message_content(m.content)}
+                for m in request.messages]
         return self.tokenizer.apply_chat_template(
             msgs,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=False,
+            enable_thinking=request.enable_thinking,
         )
 
     @staticmethod
@@ -176,7 +180,8 @@ class SplitChatCompletionRunner:
             object="chat.completion.chunk",
             created=created,
             model=self.model_name,
-            choices=[StreamChoice(index=0, delta=StreamDelta(role="assistant", content=""), finish_reason=None)],
+            choices=[StreamChoice(index=0, delta=StreamDelta(role="assistant", content=""),
+                                  finish_reason=None)],
         )
         yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
         for delta, maybe_finish in self._generate(request):
@@ -186,7 +191,8 @@ class SplitChatCompletionRunner:
                     object="chat.completion.chunk",
                     created=created,
                     model=self.model_name,
-                    choices=[StreamChoice(index=0, delta=StreamDelta(content=delta), finish_reason=None)],
+                    choices=[StreamChoice(index=0, delta=StreamDelta(content=delta),
+                                          finish_reason=None)],
                 )
                 yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
             if maybe_finish is not None:
@@ -195,7 +201,8 @@ class SplitChatCompletionRunner:
                     object="chat.completion.chunk",
                     created=created,
                     model=self.model_name,
-                    choices=[StreamChoice(index=0, delta=StreamDelta(), finish_reason=maybe_finish)],
+                    choices=[StreamChoice(index=0, delta=StreamDelta(),
+                                          finish_reason=maybe_finish)],
                 )
                 yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
         yield "data: [DONE]\n\n"

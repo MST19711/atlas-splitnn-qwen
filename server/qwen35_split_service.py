@@ -22,25 +22,21 @@ from transformers import AutoModelForCausalLM
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from qwen35_split_common import (  # noqa: E402
-    CONV_D,
-    CONV_KS,
-    HDIM,
-    HIDDEN_SIZE,
-    KV_H,
-    K_DIM,
-    K_H,
-    MIDDLE_NL_DN,
-    MIDDLE_NL_GA,
     MiddleWrapper,
-    V_DIM,
+    ModelSpec,
+    SplitConfig,
     apply_qwen35_patches,
     configure_eager_attention,
 )
 
-MODEL_NAME = "Qwen3.5-0.8B-split-4-16-4"
 PROTOCOL_VERSION = 1
-HIDDEN_SHAPE = "1,1,1024"
-HIDDEN_BYTES = HIDDEN_SIZE * 2
+
+
+def parse_split(value: str) -> tuple[int, int]:
+    parts = value.split(",")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("split must be 'prefix_end,suffix_start', e.g. '4,20'")
+    return int(parts[0]), int(parts[1])
 
 
 class ApiError(Exception):
@@ -56,6 +52,9 @@ class SessionState:
     session_id: str
     max_len: int
     device: torch.device
+    model_spec: ModelSpec = field(repr=False)
+    nl_dn: int = 0
+    nl_ga: int = 0
     created_at: float = field(default_factory=time.time)
     last_access_at: float = field(default_factory=time.time)
     position_next: int = 0
@@ -66,26 +65,37 @@ class SessionState:
     v_cache: list[torch.Tensor] = field(default_factory=list)
 
     @classmethod
-    def create(cls, session_id: str, max_len: int, device: torch.device) -> "SessionState":
+    def create(cls, session_id: str, max_len: int, device: torch.device,
+               model_spec: ModelSpec, nl_dn: int, nl_ga: int) -> "SessionState":
+        conv_ks = model_spec.linear_conv_kernel_dim
         return cls(
             session_id=session_id,
             max_len=max_len,
             device=device,
+            model_spec=model_spec,
+            nl_dn=nl_dn,
+            nl_ga=nl_ga,
             s_cache=[
-                torch.zeros((1, K_H, K_DIM, V_DIM), dtype=torch.float16, device=device)
-                for _ in range(MIDDLE_NL_DN)
+                torch.zeros((1, model_spec.linear_num_value_heads,
+                               model_spec.linear_key_head_dim,
+                               model_spec.linear_value_head_dim),
+                            dtype=torch.float16, device=device)
+                for _ in range(nl_dn)
             ],
             c_cache=[
-                torch.zeros((1, CONV_D, CONV_KS - 1), dtype=torch.float16, device=device)
-                for _ in range(MIDDLE_NL_DN)
+                torch.zeros((1, model_spec.conv_dim, conv_ks - 1),
+                            dtype=torch.float16, device=device)
+                for _ in range(nl_dn)
             ],
             k_cache=[
-                torch.zeros((1, KV_H, max_len, HDIM), dtype=torch.float16, device=device)
-                for _ in range(MIDDLE_NL_GA)
+                torch.zeros((1, model_spec.num_key_value_heads, max_len, model_spec.head_dim),
+                            dtype=torch.float16, device=device)
+                for _ in range(nl_ga)
             ],
             v_cache=[
-                torch.zeros((1, KV_H, max_len, HDIM), dtype=torch.float16, device=device)
-                for _ in range(MIDDLE_NL_GA)
+                torch.zeros((1, model_spec.num_key_value_heads, max_len, model_spec.head_dim),
+                            dtype=torch.float16, device=device)
+                for _ in range(nl_ga)
             ],
         )
 
@@ -95,13 +105,13 @@ class SessionState:
     def update_from_outputs(self, outputs: tuple[torch.Tensor, ...]) -> torch.Tensor:
         hidden = outputs[0]
         idx = 1
-        self.s_cache = list(outputs[idx : idx + MIDDLE_NL_DN])
-        idx += MIDDLE_NL_DN
-        self.c_cache = list(outputs[idx : idx + MIDDLE_NL_DN])
-        idx += MIDDLE_NL_DN
-        self.k_cache = list(outputs[idx : idx + MIDDLE_NL_GA])
-        idx += MIDDLE_NL_GA
-        self.v_cache = list(outputs[idx : idx + MIDDLE_NL_GA])
+        self.s_cache = list(outputs[idx : idx + self.nl_dn])
+        idx += self.nl_dn
+        self.c_cache = list(outputs[idx : idx + self.nl_dn])
+        idx += self.nl_dn
+        self.k_cache = list(outputs[idx : idx + self.nl_ga])
+        idx += self.nl_ga
+        self.v_cache = list(outputs[idx : idx + self.nl_ga])
         return hidden
 
 
@@ -111,6 +121,7 @@ class SplitService:
         model_path: str,
         device: str,
         max_len: int,
+        split: tuple[int, int],
         session_timeout_sec: int,
         allow_cpu_fallback: bool = False,
     ):
@@ -132,6 +143,22 @@ class SplitService:
         self.allow_cpu_fallback = allow_cpu_fallback
         self.sessions: dict[str, SessionState] = {}
         self.sessions_lock = threading.Lock()
+
+        self.model_spec = ModelSpec.from_pretrained(model_path)
+        self.split_config = SplitConfig(split[0], split[1], self.model_spec.num_hidden_layers)
+        self.mid_nl_dn, self.mid_nl_ga = self.model_spec.compute_segment(
+            *self.split_config.middle_range
+        )
+        self.hidden_size = self.model_spec.hidden_size
+        self.hidden_shape = f"1,1,{self.hidden_size}"
+        self.hidden_bytes = self.hidden_size * 2
+        prefix_ct, suffix_ct = split
+        self.model_name = (
+            f"Qwen3.5-{self.hidden_size // 1024 if self.hidden_size % 1024 == 0 else self.hidden_size}B"
+            f"-split-{prefix_ct}-{self.split_config.suffix_start - self.split_config.prefix_end}"
+            f"-{self.model_spec.num_hidden_layers - self.split_config.suffix_start}"
+        )
+
         self._load_model(model_path)
         self._stop = threading.Event()
         self._gc_thread = threading.Thread(target=self._gc_loop, daemon=True)
@@ -147,7 +174,9 @@ class SplitService:
         )
         configure_eager_attention(model)
         model = model.eval().to(torch.float16).to(self.device)
-        self.wrapper = MiddleWrapper(model.model, self.max_len).eval().to(self.device)
+        self.wrapper = MiddleWrapper(
+            model.model, self.model_spec, self.split_config, self.max_len
+        ).eval().to(self.device)
 
     def stop(self) -> None:
         self._stop.set()
@@ -170,23 +199,25 @@ class SplitService:
         return {
             "ok": True,
             "protocol_version": PROTOCOL_VERSION,
-            "model": MODEL_NAME,
+            "model": self.model_name,
             "device": str(self.device),
             "cuda_available": torch.cuda.is_available(),
             "simulation_mode": self.device.type != "cuda",
             "sessions": session_count,
+            "hidden_size": self.hidden_size,
         }
 
     def open_session(self, payload: dict) -> dict:
         session_id = str(payload.get("session_id", "")).strip()
         if not session_id:
             raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_SESSION_ID", "missing session_id")
-        if payload.get("model") != MODEL_NAME:
+        if payload.get("model") != self.model_name:
             raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_MODEL", "unsupported model")
         if int(payload.get("max_len", -1)) != self.max_len:
             raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_MAX_LEN", f"max_len must be {self.max_len}")
-        if int(payload.get("hidden_size", -1)) != HIDDEN_SIZE:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_SHAPE", f"hidden_size must be {HIDDEN_SIZE}")
+        if int(payload.get("hidden_size", -1)) != self.hidden_size:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_SHAPE",
+                           f"hidden_size must be {self.hidden_size}")
         if str(payload.get("dtype")) != "fp16":
             raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_DTYPE", "dtype must be fp16")
         if int(payload.get("protocol_version", -1)) != PROTOCOL_VERSION:
@@ -199,16 +230,21 @@ class SplitService:
         with self.sessions_lock:
             if session_id in self.sessions:
                 raise ApiError(HTTPStatus.CONFLICT, "SESSION_EXISTS", "session already exists")
-            self.sessions[session_id] = SessionState.create(session_id, self.max_len, self.device)
+            self.sessions[session_id] = SessionState.create(
+                session_id, self.max_len, self.device,
+                self.model_spec, self.mid_nl_dn, self.mid_nl_ga,
+            )
 
         return {
             "ok": True,
             "session_id": session_id,
             "max_len": self.max_len,
-            "hidden_size": HIDDEN_SIZE,
+            "hidden_size": self.hidden_size,
             "dtype": "fp16",
             "server_device": str(self.device),
-            "server_model_segment": "layers[4:20]",
+            "server_model_segment": (
+                f"layers[{self.split_config.prefix_end}:{self.split_config.suffix_start}]"
+            ),
         }
 
     def close_session(self, payload: dict) -> dict:
@@ -229,17 +265,20 @@ class SplitService:
             raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_POSITION", "invalid X-Position") from exc
 
         if headers.get("X-Protocol-Version") != str(PROTOCOL_VERSION):
-            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_PROTOCOL_VERSION", "unsupported protocol version")
-        if headers.get("X-Hidden-Shape") != HIDDEN_SHAPE:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_SHAPE", f"shape must be {HIDDEN_SHAPE}")
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_PROTOCOL_VERSION",
+                           "unsupported protocol version")
+        if headers.get("X-Hidden-Shape") != self.hidden_shape:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_SHAPE",
+                           f"shape must be {self.hidden_shape}")
         if headers.get("X-DType") != "fp16":
             raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_DTYPE", "dtype must be fp16")
         try:
             byte_length = int(headers.get("X-Byte-Length", "-1"))
         except ValueError as exc:
             raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_LENGTH", "invalid X-Byte-Length") from exc
-        if byte_length != HIDDEN_BYTES or len(body) != HIDDEN_BYTES:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_LENGTH", f"payload must be {HIDDEN_BYTES} bytes")
+        if byte_length != self.hidden_bytes or len(body) != self.hidden_bytes:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_LENGTH",
+                           f"payload must be {self.hidden_bytes} bytes")
 
         checksum = headers.get("X-Checksum")
         if checksum:
@@ -260,11 +299,12 @@ class SplitService:
                     f"expected position {session.position_next}, got {position}",
                 )
             if position >= session.max_len:
-                raise ApiError(HTTPStatus.BAD_REQUEST, "MAX_LEN_EXCEEDED", "position exceeds max_len")
+                raise ApiError(HTTPStatus.BAD_REQUEST, "MAX_LEN_EXCEEDED",
+                               "position exceeds max_len")
 
             start = time.perf_counter()
             try:
-                hidden_np = np.frombuffer(body, dtype=np.float16).reshape(1, 1, HIDDEN_SIZE)
+                hidden_np = np.frombuffer(body, dtype=np.float16).reshape(1, 1, self.hidden_size)
                 hidden = torch.from_numpy(hidden_np.copy()).to(self.device, non_blocking=True)
                 pos = torch.tensor([position], dtype=torch.int64, device=self.device)
                 with torch.no_grad():
@@ -272,7 +312,8 @@ class SplitService:
                 hidden_out = session.update_from_outputs(outputs)
                 session.position_next += 1
                 session.last_access_at = time.time()
-                hidden_bytes = hidden_out.detach().to("cpu").contiguous().numpy().astype(np.float16).tobytes()
+                hidden_bytes = (hidden_out.detach().to("cpu").contiguous()
+                                .numpy().astype(np.float16).tobytes())
             except torch.cuda.OutOfMemoryError as exc:
                 raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "CUDA_OOM", str(exc)) from exc
 
@@ -280,9 +321,9 @@ class SplitService:
             response_headers = {
                 "X-Session-Id": session_id,
                 "X-Position": str(position),
-                "X-Hidden-Shape": HIDDEN_SHAPE,
+                "X-Hidden-Shape": self.hidden_shape,
                 "X-DType": "fp16",
-                "X-Byte-Length": str(HIDDEN_BYTES),
+                "X-Byte-Length": str(self.hidden_bytes),
                 "X-Server-Latency-Ms": f"{latency_ms:.3f}",
             }
             if checksum:
@@ -294,7 +335,7 @@ SERVICE: Optional[SplitService] = None
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Qwen35SplitService/1.0"
+    server_version = "Qwen35SplitService/2.0"
 
     def log_message(self, fmt, *args):
         print(
@@ -350,7 +391,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._dispatch()
         except ApiError as exc:
-            self._send_json(exc.status, {"ok": False, "error_code": exc.error_code, "message": exc.message})
+            self._send_json(exc.status, {"ok": False, "error_code": exc.error_code,
+                                         "message": exc.message})
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
             self._send_json(
@@ -362,7 +404,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._dispatch()
         except ApiError as exc:
-            self._send_json(exc.status, {"ok": False, "error_code": exc.error_code, "message": exc.message})
+            self._send_json(exc.status, {"ok": False, "error_code": exc.error_code,
+                                         "message": exc.message})
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
             self._send_json(
@@ -379,6 +422,8 @@ def main():
     parser.add_argument("--max-len", type=int, default=16384)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--session-timeout-sec", type=int, default=300)
+    parser.add_argument("--split", type=parse_split, default=(4, 20),
+                        help="prefix_end,suffix_start  (e.g. 4,20 for 4/16/4)")
     parser.add_argument(
         "--allow-cpu-fallback",
         action="store_true",
@@ -391,6 +436,7 @@ def main():
         model_path=args.model_path,
         device=args.device,
         max_len=args.max_len,
+        split=args.split,
         session_timeout_sec=args.session_timeout_sec,
         allow_cpu_fallback=args.allow_cpu_fallback,
     )
