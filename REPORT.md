@@ -926,9 +926,22 @@ S-state（DeltaNet recurrent state）的正确 shape 为 `(1, num_v_heads, head_
 - 协议：每步 (1,1,hidden_size) FP16 = 2048/5120 bytes over SSH reverse tunnel
 
 **性能瓶颈分析：**
-- 4B 解码速度（0.3 tok/s）显著慢于 0.8B（1.8 tok/s），主因是 prefix 段每个 token 需完成完整的 ACL model execute（包含 NPU 任务下发、等待、数据搬移）
+
+4B 16K 解码速度（0.3 tok/s）比 0.8B 16K（1.3 tok/s）慢 4.3 倍，但前缀只差 2.2 倍权重。真正的瓶颈是 **suffix 的 GA 注意力层在长上下文下的 O(L) 计算**。
+
+`0.8B suffix (4 layers)` 后缀拼接: `3 层 DN (O(1)) + 1 层 GA (O(L))` — GA 只占约 25% 的后缀时间，DN 层占据了完成其余部分，最终结果是 KV cache (16K) 时 GA 注意力影响被稀释。
+
+| 指标 | 0.8B suffix GA | 4B suffix GA | 比值 |
+|------|---------------|-------------|------|
+| Q·K^T + ·V MACs | 67M | 134M | 2.0x |
+| 投影 (Q/K/V/O) MACs | 5.2M | 26.2M | 5.0x |
+| MLP MACs | 7.3M | **47.2M** | 6.5x |
+| KV DMA | 33.6MB | 67MB | 2.0x |
+| **合计** | **~82M MACs** | **~218M MACs** | **2.7x** |
+
+2.7 倍计算量 + 完整多层 GA 架构（无 DN 分摊）解释了 4.3 倍的速度差异。其余增量来自于 NPU 在更大矩阵乘法上的效率衰减（2560×4096 vs 1024×2048）。
+
 - 中段 CUDA 服务单 token 约 110ms（9 tok/s），不是瓶颈
-- prefix 段每个 token 在板端约需 4-5 秒，是主导延迟
 
 ### 板端文件布局（重要）
 
@@ -976,7 +989,7 @@ S-state（DeltaNet recurrent state）的正确 shape 为 `(1, num_v_heads, head_
 
 ### 当前局限
 
-1. **板端 decode 速度慢**：4B 模型 0.3 tok/s，主要瓶颈在板端 NPU 的 prefix/suffix 执行延迟
+1. **板端 decode 速度受 GA 注意力 O(L) 限制**：4B 16K 仅 0.3 tok/s，瓶颈在 suffix 的 1 层 GA 每步需计算 16384 个位置的注意力（218M MACs + 67MB DMA）。0.8B 16K 达 1.3 tok/s 因其后缀 4 层中仅 1 层 GA，3 层 DN(O(1)) 分摊了 GA 开销
 2. **板端 SSE 流式未修复**：板端 OM 后端 SSE 流式收尾问题仍然存在
 3. **全模型 KVCache 未更新**：`export_qwen35_kvcache.py` 仍使用硬编码的 0.8B 常量，暂不适用于 4B
 4. **OM 模型不含 position 输入时的适配**：已通过 `nl_ga > 0` 条件判断修复（仅 GQA 层需要 position）
