@@ -901,51 +901,61 @@ S-state（DeltaNet recurrent state）的正确 shape 为 `(1, num_v_heads, head_
 
 ### 端边协同实测
 
-在 SplitNN 通用化完成后，进行了两轮端边协同推理测试：
-
 **第一轮 — 0.8B 模型初步验证 (4/16/4, 256)：**
 
 | 模式 | Prefill | Decode | 输出 |
 |------|---------|--------|------|
-| 普通 | 3.8s (13 tok, 295 ms/tok) | 1.8 tok/s | "你好！很高兴见到你。有什么我可以帮你的吗？" |
-| Thinking | 5.1s (20 tok, 257 ms/tok) | 2.4 tok/s | "Thinking Process: 1. Analyze the Request..." |
+| 普通 | 3.8s (13 tok, 295 ms/tok) | 1.8 tok/s | "你好！很高兴见到你..." |
+| Thinking | 5.1s (20 tok, 257 ms/tok) | 2.4 tok/s | "Thinking Process: 1. Analyze..." |
 
-**第三轮 — 4B 全服务器 (0/32/0, 16K)：**
+**第二轮 — 4B (1/30/1, 16K) — 板端 1 GA 层瓶颈：** 0.3 tok/s, 319 tok 长上下文通过
 
-为消除板端 GA 注意力瓶颈，将切分改为 `0/32/0`：板端仅 embedding + lm_head（无任何 transformer 层），所有 32 层（含 8 层 GA）在主机 GPU 执行。
+**第三轮 — 4B 全服务器 (0/32/0, 16K) — GA 全 offload：**
 
-| 指标 | 1/30/1 (板端 1GA) | 0/32/0 (全服务器) | 变化 |
-|------|------------------|-------------------|------|
-| Prefill (13 tok) | 63.4s | **5.1s** | **12.4x** |
-| Prefill (419 tok) | — | 103s (246 ms/tok) | — |
-| Decode | 0.3 tok/s | **1.2 tok/s** | **4x** |
-| 短问答 | 你好！有什么我可以帮你的吗？... | 你好！有什么问题我可以帮你的吗？😊 | ✓ |
+| 指标 | 1/30/1 | 0/32/0 | 变化 |
+|------|--------|--------|------|
+| Decode | 0.3 tok/s | **1.2 tok/s** | 4x |
+| Prefill (13 tok) | 63.4s | 5.1s | 12.4x |
 | 长上下文 | 收到。 | 收到。 | ✓ |
 
-**4x decode 提速验证了瓶颈分析的结论**：0.3 → 1.2 tok/s 正好对应板端 1 GA 层 16K 注意力（约 1.5s）被移除。剩余 ~0.8s/token 来自服务器 32 层全模型推理 + 网络延迟。
+### msprof 精确性能剖析
 
-**硬件配置：**
-- 开发板：Atlas 200I DK A2 (Ascend310B4, 4GB NPU) — OM 前后段
-- 主机：x86_64 + RTX 5070 Ti (16GB) — CUDA PyTorch 中段
-- 协议：每步 (1,1,hidden_size) FP16 = 2048/5120 bytes over SSH reverse tunnel
+使用 CANN `msprof`（`--ascendcl=on --task-time=on`）对板端 OM 执行进行算子级时序采集：
 
-**性能瓶颈分析：**
+**0.8B Suffix（4 层: 3DN+1GA+norm+lm_head, 256 ctx）：**
 
-4B 16K 解码速度（0.3 tok/s）比 0.8B 16K（1.3 tok/s）慢 4.3 倍，但前缀只差 2.2 倍权重。真正的瓶颈是 **suffix 的 GA 注意力层在长上下文下的 O(L) 计算**。
+| OP Type | Core | 次数 | 总计 | 最大单次 |
+|---------|------|-----|------|---------|
+| BatchMatMulV2（全部 matmul） | AI_CORE | 34 | **60.9 ms** | 45.4 ms |
+| Mul/Cast/Conv2D 等 | — | — | <3 ms | — |
 
-`0.8B suffix (4 layers)` 后缀拼接: `3 层 DN (O(1)) + 1 层 GA (O(L))` — GA 只占约 25% 的后缀时间，DN 层占据了完成其余部分，最终结果是 KV cache (16K) 时 GA 注意力影响被稀释。
+**4B Head（仅 norm + lm_head, 16K ctx）：**
 
-| 指标 | 0.8B suffix GA | 4B suffix GA | 比值 |
-|------|---------------|-------------|------|
-| Q·K^T + ·V MACs | 67M | 134M | 2.0x |
-| 投影 (Q/K/V/O) MACs | 5.2M | 26.2M | 5.0x |
-| MLP MACs | 7.3M | **47.2M** | 6.5x |
-| KV DMA | 33.6MB | 67MB | 2.0x |
-| **合计** | **~82M MACs** | **~218M MACs** | **2.7x** |
+| OP Type | Core | 次数 | 总计 |
+|---------|------|-----|------|
+| **BatchMatMulV2 (lm_head)** | **AI_CORE** | **1** | **556.9 ms** |
+| rmsnorm ×5 | AI_VECTOR | 5 | <0.1 ms |
 
-2.7 倍计算量 + 完整多层 GA 架构（无 DN 分摊）解释了 4.3 倍的速度差异。其余增量来自于 NPU 在更大矩阵乘法上的效率衰减（2560×4096 vs 1024×2048）。
+**根因分析：**
 
-- 中段 CUDA 服务单 token 约 110ms（9 tok/s），不是瓶颈
+- 4B lm_head（2560×248320, 635M 参数）单次 MatMul **557 ms**，占 Head OM 执行时间的 99.9%
+- 0.8B lm_head（1024×248320, 254M 参数）仅 45 ms——尺寸差 2.5 倍，耗时差 **12 倍**
+- msprof 报告标注 `Low data memory handling efficiency` for lm_head — Ascend310B4 DDR 带宽在 2560 维度下 tiling 参数恶化
+- Embed OM（仅查表）<10μs，可忽略
+
+**0/32/0 方案的 833 ms/tok 分布：**
+
+```
+Head OM lm_head MatMul:  557 ms (67%) ← 唯一瓶颈
+Host middle 32层 + 网络:  250 ms (30%)
+采样 + Python:             30 ms ( 3%)
+```
+
+### 硬件配置
+
+- 开发板：Atlas 200I DK A2 (Ascend310B4, 4GB NPU)
+- 主机：x86_64 + RTX 5070 Ti (16GB) — CUDA PyTorch
+- 协议：每步 (1,1,hidden_size) FP16 over SSH reverse tunnel
 
 ### 板端文件布局（重要）
 
