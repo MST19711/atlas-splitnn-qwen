@@ -152,9 +152,12 @@ class SplitService:
         self.hidden_size = self.model_spec.hidden_size
         self.hidden_shape = f"1,1,{self.hidden_size}"
         self.hidden_bytes = self.hidden_size * 2
+        # Extract model size from path basename (e.g. "Qwen3.5-4B" → "4B")
+        import os
+        model_size = os.path.basename(os.path.normpath(model_path)).split("-")[-1]
         prefix_ct, suffix_ct = split
         self.model_name = (
-            f"Qwen3.5-{self.hidden_size // 1024 if self.hidden_size % 1024 == 0 else self.hidden_size}B"
+            f"Qwen3.5-{model_size}"
             f"-split-{prefix_ct}-{self.split_config.suffix_start - self.split_config.prefix_end}"
             f"-{self.model_spec.num_hidden_layers - self.split_config.suffix_start}"
         )

@@ -29,8 +29,9 @@ def parse_split(value: str) -> tuple[int, int]:
 
 
 def _make_model_name(model_spec: ModelSpec, split: tuple[int, int], engine: str) -> str:
+    size_map = {1024: "0.8B", 2048: "2B", 2560: "4B", 4096: "9B", 5120: "27B"}
     hs = model_spec.hidden_size
-    size_str = f"{hs // 1024 if hs % 1024 == 0 else hs}B" if hs >= 1024 else str(hs)
+    size_str = size_map.get(hs, f"{hs}")
     prefix_ct = split[0]
     suffix_ct = model_spec.num_hidden_layers - split[1]
     middle_ct = split[1] - split[0]

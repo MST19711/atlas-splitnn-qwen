@@ -175,8 +175,10 @@ def main():
     suffix_ct = model_spec.num_hidden_layers - split_config.suffix_start
     middle_ct = split_config.suffix_start - split_config.prefix_end
     hs = model_spec.hidden_size
-    size_str = f"{hs // 1024}" if hs % 1024 == 0 else str(hs)
-    model_name = args.remote_model_name or f"Qwen3.5-{size_str}B-split-{prefix_ct}-{middle_ct}-{suffix_ct}"
+    # Model sizes lookup by hidden_size
+    size_map = {1024: "0.8B", 2048: "2B", 2560: "4B", 4096: "9B", 5120: "27B"}
+    size_str = size_map.get(hs, str(hs))
+    model_name = args.remote_model_name or f"Qwen3.5-{size_str}-split-{prefix_ct}-{middle_ct}-{suffix_ct}"
 
     # Create engine
     from controller.engine.om_engine import OmSplitEngine
