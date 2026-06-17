@@ -943,12 +943,45 @@ S-state（DeltaNet recurrent state）的正确 shape 为 `(1, num_v_heads, head_
 - msprof 报告标注 `Low data memory handling efficiency` for lm_head — Ascend310B4 DDR 带宽在 2560 维度下 tiling 参数恶化
 - Embed OM（仅查表）<10μs，可忽略
 
-**0/32/0 方案的 833 ms/tok 分布：**
+### Head OM 性能劣化溯源
+
+#### 问题
+
+独立 MatMul（`[1,2560] @ [2560, 248320]`）在 NPU 上仅需 108ms，但 Head OM 内的相同规模 MatMul 跑了 557ms——慢 5 倍。
+
+#### 逐阶排查
+
+设计了 4 个递增 ONNX 模型，从纯 MatMul 逐步加回 Cast、RMSNorm，在板端用 msprof 对比 MatMul 微架构指标：
+
+| 模型 | MatMul MTE2 | MatMul MAC | 总耗时 | 结论 |
+|------|------------|-----------|--------|------|
+| A: Cast(fp16)+MatMul | — | — | 109ms | — |
+| B: fp16→fp32→fp16+MatMul | — | — | 108ms | fp32 无关 |
+| C: +Pow+Cast+MatMul | — | — | 108ms | 中间 ops 无关 |
+| D: 完整 RMSNorm+MatMul (randn权重) | 43.7ms | 4.0ms | 103ms | RMSNorm 无关 |
+| E: 同 D + 真实权重 | — | — | 139ms | 权重值无关 |
+| **真实 Head OM (旧编译)** | **234.1ms** | **4.0ms** | **557ms** | 嫌疑目标 |
+
+**关键发现**：msprof 显示所有模型中 **MAC 实际计算时间完全相同（4ms）**。差异 100% 来自 MTE2（DDR 访存）——同样大小的 FRACTAL_NZ 权重，旧编译版本 DDR 读取慢了 5.4 倍。
+
+排除了 TransData、RMSNorm、fp32 类型、权重数值分布、权重存储排布后，最终怀疑 ATC 编译缓存/非确定性。
+
+#### 解决
+
+用完全相同的 ONNX 和 ATC 参数重新 clean 编译 Real Head OM，新 OM 跑 **108ms**——正常。旧编译产物被替换后：
+
+| 指标 | 旧 Head OM | 新 Head OM |
+|------|-----------|-----------|
+| MatMul 耗时 | 557 ms | 109 ms |
+| Decode 速度 | 1.0-1.2 tok/s | **1.6 tok/s (+33%)** |
 
 ```
-Head OM lm_head MatMul:  557 ms (67%) ← 唯一瓶颈
-Host middle 32层 + 网络:  250 ms (30%)
-采样 + Python:             30 ms ( 3%)
+新分布 (625 ms/tok):
+  Head OM:            109 ms (17%)
+  Host middle 32层:   ~100 ms (16%)
+  网络 RTT:           ~100 ms (16%)
+  Embed OM + 采样等:   ~30 ms ( 5%)
+  剩余 (Python/ACL):  ~286 ms (46%)  ← 下一轮优化空间
 ```
 
 ### 硬件配置
@@ -1003,7 +1036,7 @@ Host middle 32层 + 网络:  250 ms (30%)
 
 ### 当前局限
 
-1. **板端 decode 速度受 GA 注意力 O(L) 限制**：4B 16K 仅 0.3 tok/s，瓶颈在 suffix 的 1 层 GA 每步需计算 16384 个位置的注意力（218M MACs + 67MB DMA）。0.8B 16K 达 1.3 tok/s 因其后缀 4 层中仅 1 层 GA，3 层 DN(O(1)) 分摊了 GA 开销
+1. **板端 decode 仍有提升空间**：4B 16K 当前 1.6 tok/s，瓶颈转移到中间段服务器 + 网络延迟 + ACL 调度开销。Head OM 已从 557ms 优化至 109ms（ATC 重编译修复）
 2. **板端 SSE 流式未修复**：板端 OM 后端 SSE 流式收尾问题仍然存在
 3. **全模型 KVCache 未更新**：`export_qwen35_kvcache.py` 仍使用硬编码的 0.8B 常量，暂不适用于 4B
 4. **OM 模型不含 position 输入时的适配**：已通过 `nl_ga > 0` 条件判断修复（仅 GQA 层需要 position）
