@@ -365,13 +365,32 @@ class MiddleWrapper(SegmentRunner):
 
 
 class SuffixWrapper(SegmentRunner):
-    def __init__(self, text_model, model_spec: ModelSpec, split_config: SplitConfig, max_len: int, lm_head):
+    def __init__(self, text_model, model_spec: ModelSpec, split_config: SplitConfig,
+                 max_len: int, lm_head, lm_chunk: int = 0):
         start, end = split_config.suffix_range
         super().__init__(text_model, model_spec, start, end, max_len)
         self.lm_head = lm_head
+        self.lm_chunk = lm_chunk
 
     def forward(self, hidden_states, position, *cache_flat):
         hidden, pres_s, pres_c, pres_k, pres_v = self._forward_layers(hidden_states, position, cache_flat)
         hidden = self.model.norm(hidden)
-        logits = self.lm_head(hidden)
+        if self.lm_chunk <= 0:
+            logits = self.lm_head(hidden)
+        else:
+            # Chunked lm_head: split hidden_dim into chunks to improve NPU tiling
+            W = self.lm_head.weight  # (vocab_size, hidden_size)
+            _, _, hs = hidden.shape
+            start = 0
+            logits = None
+            while start < hs:
+                end = min(start + self.lm_chunk, hs)
+                chunk = hidden[:, :, start:end]
+                chunk_w = W[:, start:end]
+                partial = chunk @ chunk_w.T
+                if logits is None:
+                    logits = partial
+                else:
+                    logits = logits + partial
+                start = end
         return (logits, *pres_s, *pres_c, *pres_k, *pres_v)
