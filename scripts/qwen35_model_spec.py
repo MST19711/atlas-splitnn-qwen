@@ -32,6 +32,7 @@ class ModelSpec:
     linear_conv_kernel_dim: int
     full_attention_interval: int
     layer_types: list[str] = field(repr=False)
+    rms_norm_eps: float = 1e-6
 
     @classmethod
     def from_pretrained(cls, model_path: str) -> "ModelSpec":
@@ -65,6 +66,7 @@ class ModelSpec:
             linear_value_head_dim=tc.linear_value_head_dim,
             linear_conv_kernel_dim=tc.linear_conv_kernel_dim,
             full_attention_interval=interval,
+            rms_norm_eps=getattr(tc, "rms_norm_eps", 1e-6),
             layer_types=layer_types,
         )
 
@@ -98,6 +100,7 @@ class ModelSpec:
             "linear_value_head_dim": self.linear_value_head_dim,
             "linear_conv_kernel_dim": self.linear_conv_kernel_dim,
             "full_attention_interval": self.full_attention_interval,
+            "rms_norm_eps": self.rms_norm_eps,
             "conv_dim": self.conv_dim,
             "layer_types": self.layer_types,
         }
@@ -118,6 +121,7 @@ class ModelSpec:
             linear_value_head_dim=d["linear_value_head_dim"],
             linear_conv_kernel_dim=d["linear_conv_kernel_dim"],
             full_attention_interval=d["full_attention_interval"],
+            rms_norm_eps=d.get("rms_norm_eps", 1e-6),
             layer_types=d["layer_types"],
         )
 
@@ -169,6 +173,28 @@ class SplitConfig:
         )
 
 
+@dataclass
+class BoundEmbedHeadConfig:
+    tied_weight_path: str
+    final_norm_path: str
+    dtype: str = "float16"
+
+    def to_dict(self) -> dict:
+        return {
+            "tied_weight_path": self.tied_weight_path,
+            "final_norm_path": self.final_norm_path,
+            "dtype": self.dtype,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BoundEmbedHeadConfig":
+        return cls(
+            tied_weight_path=d["tied_weight_path"],
+            final_norm_path=d["final_norm_path"],
+            dtype=d.get("dtype", "float16"),
+        )
+
+
 # ── Metadata helpers ────────────────────────────────────────────────────
 
 
@@ -201,3 +227,42 @@ def load_metadata(meta_path: str) -> tuple[ModelSpec, SplitConfig, int, int]:
     model_spec = ModelSpec.from_dict(meta["model_spec"])
     split_config = SplitConfig.from_dict(meta["split_config"])
     return model_spec, split_config, meta["nl_dn"], meta["nl_ga"]
+
+
+def export_bound_embed_head_metadata(
+    model_spec: ModelSpec,
+    split_config: SplitConfig,
+    output_dir: str,
+    tied_weight_name: str = "tied_weight.bin",
+    final_norm_name: str = "final_norm_weight.bin",
+) -> str:
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "model_spec": model_spec.to_dict(),
+        "split_config": split_config.to_dict(),
+        "mode": "bound_embed_head",
+        "bound_embed_head": BoundEmbedHeadConfig(
+            tied_weight_path=tied_weight_name,
+            final_norm_path=final_norm_name,
+        ).to_dict(),
+    }
+    meta_path = out_dir / "bound_embed_head.metadata.json"
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"metadata: {meta_path}")
+    return str(meta_path)
+
+
+def load_bound_embed_head_metadata(
+    meta_path_or_dir: str,
+) -> tuple[ModelSpec, SplitConfig, BoundEmbedHeadConfig]:
+    path = Path(meta_path_or_dir)
+    if path.is_dir():
+        path = path / "bound_embed_head.metadata.json"
+    with open(path) as f:
+        meta = json.load(f)
+    model_spec = ModelSpec.from_dict(meta["model_spec"])
+    split_config = SplitConfig.from_dict(meta["split_config"])
+    bound_cfg = BoundEmbedHeadConfig.from_dict(meta["bound_embed_head"])
+    return model_spec, split_config, bound_cfg

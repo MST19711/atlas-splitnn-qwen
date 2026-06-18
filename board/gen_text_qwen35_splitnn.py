@@ -22,6 +22,7 @@ sys.path.insert(0, str(_deploy_dir / "scripts"))
 sys.path.insert(0, str(_deploy_dir))
 
 from qwen35_model_spec import load_metadata
+from qwen35_model_spec import load_bound_embed_head_metadata
 from transformers import AutoTokenizer
 
 PROTOCOL_VERSION = 1
@@ -145,6 +146,8 @@ def main():
     parser.add_argument("--server-url", default="http://127.0.0.1:18080")
     parser.add_argument("--prefix-model", default="qwen3.5_split_prefix_max16384.om")
     parser.add_argument("--suffix-model", default="qwen3.5_split_suffix_max16384.om")
+    parser.add_argument("--om-mode", choices=["om_split", "bound_embed_head"], default="om_split")
+    parser.add_argument("--bound-asset-dir", default="")
     parser.add_argument("--tokenizer-dir", default="/root/slm_deploy")
     parser.add_argument("--max-tokens", type=int, default=50)
     parser.add_argument("--max-len", type=int, default=16384)
@@ -158,17 +161,23 @@ def main():
     args = parser.parse_args()
 
     # Load metadata from prefix ONNX's companion JSON
-    prefix_meta = Path(args.prefix_model).with_suffix(".metadata.json")
-    if not prefix_meta.exists():
-        # Try same name but .onnx.metadata.json
-        alt = Path(str(args.prefix_model).replace(".om", ".metadata.json"))
-        if alt.exists():
-            prefix_meta = alt
-    if not prefix_meta.exists():
-        print(f"ERROR: metadata not found at {prefix_meta}", file=sys.stderr)
-        sys.exit(1)
+    if args.om_mode == "bound_embed_head":
+        if not args.bound_asset_dir:
+            print("ERROR: --bound-asset-dir is required for bound_embed_head mode", file=sys.stderr)
+            sys.exit(1)
+        model_spec, split_config, _ = load_bound_embed_head_metadata(args.bound_asset_dir)
+    else:
+        prefix_meta = Path(args.prefix_model).with_suffix(".metadata.json")
+        if not prefix_meta.exists():
+            # Try same name but .onnx.metadata.json
+            alt = Path(str(args.prefix_model).replace(".om", ".metadata.json"))
+            if alt.exists():
+                prefix_meta = alt
+        if not prefix_meta.exists():
+            print(f"ERROR: metadata not found at {prefix_meta}", file=sys.stderr)
+            sys.exit(1)
 
-    model_spec, split_config, _, _ = load_metadata(str(prefix_meta))
+        model_spec, split_config, _, _ = load_metadata(str(prefix_meta))
 
     # Build model name (must match server-side naming)
     prefix_ct = split_config.prefix_end
@@ -189,6 +198,8 @@ def main():
         split_config=split_config,
         prefix_om=args.prefix_model,
         suffix_om=args.suffix_model,
+        mode=args.om_mode,
+        bound_asset_dir=args.bound_asset_dir or None,
     )
     engine.load()
 

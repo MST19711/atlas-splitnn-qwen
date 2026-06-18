@@ -12,7 +12,7 @@ import traceback
 import zlib
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional
 
@@ -102,6 +102,18 @@ class SessionState:
     def flat_cache(self) -> list[torch.Tensor]:
         return [*self.s_cache, *self.c_cache, *self.k_cache, *self.v_cache]
 
+    def cache_bytes(self) -> int:
+        total = 0
+        for tensor in self.flat_cache():
+            total += tensor.numel() * tensor.element_size()
+        return total
+
+    def release(self) -> None:
+        self.s_cache.clear()
+        self.c_cache.clear()
+        self.k_cache.clear()
+        self.v_cache.clear()
+
     def update_from_outputs(self, outputs: tuple[torch.Tensor, ...]) -> torch.Tensor:
         hidden = outputs[0]
         idx = 1
@@ -123,6 +135,7 @@ class SplitService:
         max_len: int,
         split: tuple[int, int],
         session_timeout_sec: int,
+        max_sessions: int,
         allow_cpu_fallback: bool = False,
     ):
         requested_device = torch.device(device)
@@ -140,6 +153,7 @@ class SplitService:
         self.device = requested_device
         self.max_len = max_len
         self.session_timeout_sec = session_timeout_sec
+        self.max_sessions = max_sessions
         self.allow_cpu_fallback = allow_cpu_fallback
         self.sessions: dict[str, SessionState] = {}
         self.sessions_lock = threading.Lock()
@@ -167,6 +181,19 @@ class SplitService:
         self._gc_thread = threading.Thread(target=self._gc_loop, daemon=True)
         self._gc_thread.start()
 
+    def _release_sessions(self, session_ids: list[str]) -> int:
+        released = 0
+        with self.sessions_lock:
+            for session_id in session_ids:
+                session = self.sessions.pop(session_id, None)
+                if session is None:
+                    continue
+                session.release()
+                released += 1
+        if released and self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        return released
+
     def _load_model(self, model_path: str) -> None:
         apply_qwen35_patches()
         model = AutoModelForCausalLM.from_pretrained(
@@ -193,12 +220,12 @@ class SplitService:
                 for session_id, session in self.sessions.items():
                     if now - session.last_access_at > self.session_timeout_sec:
                         expired.append(session_id)
-                for session_id in expired:
-                    del self.sessions[session_id]
+            self._release_sessions(expired)
 
     def health(self) -> dict:
         with self.sessions_lock:
             session_count = len(self.sessions)
+            session_cache_bytes = sum(session.cache_bytes() for session in self.sessions.values())
         return {
             "ok": True,
             "protocol_version": PROTOCOL_VERSION,
@@ -207,6 +234,8 @@ class SplitService:
             "cuda_available": torch.cuda.is_available(),
             "simulation_mode": self.device.type != "cuda",
             "sessions": session_count,
+            "max_sessions": self.max_sessions,
+            "session_cache_mb_estimate": round(session_cache_bytes / (1024 * 1024), 3),
             "hidden_size": self.hidden_size,
         }
 
@@ -231,6 +260,12 @@ class SplitService:
             )
 
         with self.sessions_lock:
+            if len(self.sessions) >= self.max_sessions:
+                raise ApiError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "TOO_MANY_SESSIONS",
+                    f"active sessions exceed limit {self.max_sessions}",
+                )
             if session_id in self.sessions:
                 raise ApiError(HTTPStatus.CONFLICT, "SESSION_EXISTS", "session already exists")
             self.sessions[session_id] = SessionState.create(
@@ -254,8 +289,7 @@ class SplitService:
         session_id = str(payload.get("session_id", "")).strip()
         if not session_id:
             raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_SESSION_ID", "missing session_id")
-        with self.sessions_lock:
-            released = self.sessions.pop(session_id, None) is not None
+        released = self._release_sessions([session_id]) > 0
         return {"ok": True, "session_id": session_id, "released": released}
 
     def step_session(self, headers, body: bytes) -> tuple[bytes, dict]:
@@ -318,6 +352,7 @@ class SplitService:
                 hidden_bytes = (hidden_out.detach().to("cpu").contiguous()
                                 .numpy().astype(np.float16).tobytes())
             except torch.cuda.OutOfMemoryError as exc:
+                self._release_sessions([session_id])
                 raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "CUDA_OOM", str(exc)) from exc
 
             latency_ms = (time.perf_counter() - start) * 1000.0
@@ -424,7 +459,8 @@ def main():
     parser.add_argument("--model-path", default="model/Qwen3.5-0.8B")
     parser.add_argument("--max-len", type=int, default=16384)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--session-timeout-sec", type=int, default=300)
+    parser.add_argument("--session-timeout-sec", type=int, default=60)
+    parser.add_argument("--max-sessions", type=int, default=2)
     parser.add_argument("--split", type=parse_split, default=(4, 20),
                         help="prefix_end,suffix_start  (e.g. 4,20 for 4/16/4)")
     parser.add_argument(
@@ -441,9 +477,10 @@ def main():
         max_len=args.max_len,
         split=args.split,
         session_timeout_sec=args.session_timeout_sec,
+        max_sessions=args.max_sessions,
         allow_cpu_fallback=args.allow_cpu_fallback,
     )
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server = HTTPServer((args.host, args.port), Handler)
     print(f"Listening on http://{args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()

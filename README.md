@@ -14,8 +14,11 @@
 | Qwen3.5 KV Cache | Qwen3.5-0.8B | 256 tok | 1.9 GB |
 | Qwen3.5 KV Cache | Qwen3.5-0.8B | 1024 tok | 1.9 GB |
 | **Qwen3.5 SplitNN** | **Qwen3.5-4B (1/30/1)** | **16K tok** | **Prefix+Suffix ~2.8 GB** |
+| **Qwen3.5 SplitNN 参数绑定** | **Qwen3.5-2B (0/24/0)** | **8K tok** | **板端共享 tied weight 970MB + 单算子 head OM 14KB** |
 
 > SplitNN 方案在开发机 ONNX 后端已联调通过，4B 模型 16K 上下文可稳定推理。板端 OM 部署待 ATC 编译后实测。
+>
+> 目前仓库已新增一条可实际部署到开发板的 `Qwen3.5-2B split 0/24/0` 参数绑定链路：板端提供 OpenAI 兼容控制器，主机承担全部 Transformer 主干层，板端仅执行 `embedding + tied lm_head`。
 
 ---
 
@@ -41,6 +44,7 @@
 │   ├── qwen35_split_common.py     # SplitNN 共享代码（Wrappers + Patches）
 │   ├── export_qwen35_split_prefix.py   # Prefix ONNX 导出（支持 --split）
 │   ├── export_qwen35_split_suffix.py   # Suffix ONNX 导出（支持 --split）
+│   ├── export_qwen35_bound_embed_head.py  # 导出参数绑定资产（tied weight + metadata）
 │   ├── export_qwen3_kvcache.py         # Qwen3 KV Cache 导出
 │   ├── export_qwen35_kvcache.py          # Qwen3.5 DeltaNet KV Cache 导出
 │   ├── gen_input_shape.py        # ONNX → ATC INPUT_SHAPE 辅助
@@ -49,6 +53,7 @@
 │   ├── gen_text_qwen3_kvcache.py       # Qwen3 KV Cache 推理
 │   ├── gen_text_qwen35_kvcache.py        # Qwen3.5 DeltaNet KV Cache 推理
 │   ├── gen_text_qwen35_splitnn.py        # Qwen3.5 SplitNN 推理（复用 OmSplitEngine）
+│   └── run_openai_split_controller_bound_2b.sh  # 板端 OpenAI 控制器启动脚本（2B 参数绑定）
 │   └── run_qwen3_kvcache.sh
 ├── controller/               # SplitNN 控制器（OpenAI API + 可插拔前后段引擎）
 │   ├── openai_split_controller.py   # FastAPI 入口
@@ -70,6 +75,292 @@
 ---
 
 ## 快速开始
+
+### 新增：Qwen3.5-2B SplitNN 参数绑定链路
+
+这条链路的目标是以尽可能小的板端改动支持参数绑定：
+
+- 主机：
+  - 运行 `Qwen3.5-2B` 的全部 24 层 Transformer 主干
+  - 提供中段 HTTP 服务
+- 开发板：
+  - 运行 OpenAI 兼容控制器
+  - `run_prefix()` 执行 embedding lookup
+  - `run_suffix()` 执行 tied `lm_head`
+
+控制器外部接口不变，仍然使用：
+
+```text
+POST /v1/chat/completions
+GET  /v1/models
+GET  /healthz
+```
+
+### 1. 准备 2B 参数绑定资产
+
+在主机上导出板端需要的共享权重与元数据：
+
+```bash
+cd /home/CX_Li/EF_clean
+
+pixi run python scripts/export_qwen35_bound_embed_head.py \
+  --model-path model_dl/Qwen3.5-2B \
+  --output-dir qwen3.5_2b_bound_embed_head \
+  --split 0,24
+```
+
+导出目录至少包含：
+
+```text
+qwen3.5_2b_bound_embed_head/
+├── tied_weight.bin
+├── final_norm_weight.bin
+└── bound_embed_head.metadata.json
+```
+
+### 2. 编译板端 `lm_head` 单算子模型
+
+参数绑定模式下，板端 `run_suffix()` 默认可退回 CPU `numpy`，但为了可用速度，实际部署时应为真实 head shape 编译 ACL single-op `MatMul`：
+
+```bash
+mkdir -p tmp_singleop_matmul_qwen35_2b_head/run/out/test_data/config
+cat > tmp_singleop_matmul_qwen35_2b_head/run/out/test_data/config/acl_op.json <<'EOF'
+[
+  {
+    "op": "MatMul",
+    "input_desc": [
+      {"format": "ND", "type": "float16", "shape": [1, 2048]},
+      {"format": "ND", "type": "float16", "shape": [248320, 2048]}
+    ],
+    "output_desc": [
+      {"format": "ND", "type": "float16", "shape": [1, 248320]}
+    ],
+    "attr": [
+      {"name": "transpose_x1", "type": "bool", "value": false},
+      {"name": "transpose_x2", "type": "bool", "value": true}
+    ]
+  }
+]
+EOF
+```
+
+使用现有 CANN 7 容器编译：
+
+```bash
+podman run --rm --network=host --http-proxy=false \
+  -e http_proxy= -e https_proxy= -e HTTP_PROXY= -e HTTPS_PROXY= \
+  -v /home/CX_Li/EF_clean:/workspace:Z \
+  -w /workspace/tmp_singleop_matmul_qwen35_2b_head/run/out \
+  localhost/cann-atc-rocky:v7 \
+  bash -lc 'atc --singleop=test_data/config/acl_op.json \
+    --soc_version=Ascend310B4 \
+    --output=op_models'
+```
+
+编译结果示例：
+
+```text
+op_models/0_MatMul_1_2_1_2048_1_2_248320_2048_1_2_1_248320.om
+```
+
+### 3. 同步到开发板
+
+```bash
+sshpass -p 'Mind@123' ssh -F /dev/null -o StrictHostKeyChecking=no \
+  root@192.168.137.100 'mkdir -p /root/slm_deploy/qwen3.5_2b_bound_embed_head/op_models'
+
+sshpass -p 'Mind@123' scp -F /dev/null -o StrictHostKeyChecking=no \
+  qwen3.5_2b_bound_embed_head/* \
+  root@192.168.137.100:/root/slm_deploy/qwen3.5_2b_bound_embed_head/
+
+sshpass -p 'Mind@123' scp -F /dev/null -o StrictHostKeyChecking=no \
+  tmp_singleop_matmul_qwen35_2b_head/run/out/op_models/* \
+  root@192.168.137.100:/root/slm_deploy/qwen3.5_2b_bound_embed_head/op_models/
+
+sshpass -p 'Mind@123' scp -F /dev/null -o StrictHostKeyChecking=no \
+  controller/openai_split_controller.py \
+  controller/orchestrator.py \
+  controller/remote_middle.py \
+  controller/schemas.py \
+  controller/engine/om_engine.py \
+  scripts/qwen35_model_spec.py \
+  board/run_openai_split_controller_bound_2b.sh \
+  root@192.168.137.100:/root/slm_deploy/
+```
+
+如果板端目录结构已经和仓库同步过，只需要额外更新：
+
+- `controller/engine/om_engine.py`
+- `controller/openai_split_controller.py`
+- `controller/orchestrator.py`
+- `scripts/qwen35_model_spec.py`
+- `board/run_openai_split_controller_bound_2b.sh`
+- `qwen3.5_2b_bound_embed_head/`
+
+### 4. 启动主机侧中段服务
+
+```bash
+cd /home/CX_Li/EF_clean
+
+pixi run python server/qwen35_split_service.py \
+  --host 127.0.0.1 \
+  --port 18080 \
+  --model-path model_dl/Qwen3.5-2B \
+  --split 0,24 \
+  --device cuda:0 \
+  --max-len 8192 \
+  --session-timeout-sec 60 \
+  --max-sessions 1
+```
+
+推荐保留 `--max-sessions 1`。当前这条 `0/24/0` 参数绑定链路默认按“单开发板控制器 + 单主机中段服务”部署，额外并发只会放大 session cache 与 HTTP 请求处理开销。
+
+再建立反向 SSH 映射，使开发板通过自身 `127.0.0.1:28080` 访问主机 `18080`：
+
+```bash
+sshpass -p 'Mind@123' ssh -F /dev/null \
+  -o StrictHostKeyChecking=no \
+  -o ExitOnForwardFailure=yes \
+  -N -R 28080:127.0.0.1:18080 \
+  root@192.168.137.100
+```
+
+### 5. 启动开发板 OpenAI 控制器
+
+登录开发板后执行：
+
+```bash
+cd /root/slm_deploy
+./run_openai_split_controller_bound_2b.sh
+```
+
+后台运行：
+
+```bash
+cd /root/slm_deploy
+nohup ./run_openai_split_controller_bound_2b.sh >/tmp/bound_controller.log 2>&1 &
+tail -f /tmp/bound_controller.log
+```
+
+### 6. 手动测试 OpenAI 接口
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:8000/healthz
+curl http://127.0.0.1:8000/v1/models
+```
+
+非流式：
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-2b-split-0-24-0-om",
+    "messages": [
+      {"role": "user", "content": "请用三句话介绍一下你自己"}
+    ],
+    "temperature": 0.0,
+    "max_tokens": 64,
+    "stream": false
+  }'
+```
+
+流式：
+
+```bash
+curl -N http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-2b-split-0-24-0-om",
+    "messages": [
+      {"role": "user", "content": "你好，请简单和我打个招呼"}
+    ],
+    "temperature": 0.0,
+    "max_tokens": 32,
+    "stream": true
+  }'
+```
+
+如果想观察纯 SSE 数据，可以再接一段：
+
+```bash
+curl -N http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-2b-split-0-24-0-om",
+    "messages": [
+      {"role": "user", "content": "你好，请简单和我打个招呼"}
+    ],
+    "temperature": 0.0,
+    "max_tokens": 32,
+    "stream": true
+  }' | sed -n 's/^data: //p'
+```
+
+开启 thinking：
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-2b-split-0-24-0-om",
+    "messages": [
+      {"role": "user", "content": "请先认真思考，再简短回答：1+1为什么等于2？"}
+    ],
+    "temperature": 0.0,
+    "max_tokens": 128,
+    "stream": false,
+    "enable_thinking": true
+  }'
+```
+
+`Qwen3.5-2B` 当前部署默认不建议开启 thinking。实际联调中发现 2B thinking 模式容易出现长时间思维链循环、乱码和收尾失败；控制器当前会直接拒绝这一路径，建议显式使用 `enable_thinking=false`。
+
+### 6.1 断连与清理行为
+
+当前控制器已补充“请求方断连后自动取消”的处理：
+
+- 流式请求如果前端程序崩溃、浏览器标签页关闭、或命令行 `Ctrl+C` 中断，控制器会在当前 token step 结束后停止生成
+- 非流式请求如果客户端提前断开，也会设置取消标志并尽快退出生成循环
+- 退出时会自动执行远端 `session/close`，并调用本地 `engine.end_session()`
+
+需要注意的是，取消粒度仍是“当前 step 完成后”而不是立即抢占。也就是说，如果控制器正阻塞在一次 `remote_middle.step()` 中，仍需等这一小步返回后才能进入清理逻辑。
+
+### 7. 当前状态
+
+目前这条 `Qwen3.5-2B split 0/24/0` 参数绑定链路已经完成以下验证：
+
+- 开发板控制器可正常启动，不再卡在 `Waiting for application startup`
+- 非流式 OpenAI 兼容请求可正常返回文本
+- 流式 OpenAI 兼容请求可完整返回 SSE chunk 与 `[DONE]`
+- 客户端中途断开后，控制器不会再无限继续生成；会在当前 step 完成后自动关闭远端 session
+- 板端实际生成路径为：
+  - `run_prefix()`：共享 tied weight 的 embedding lookup
+  - `remote_middle.step()`：主机侧全部 24 层 Transformer 主干
+  - `run_suffix()`：开发板 ACL single-op `MatMul` 执行 tied `lm_head`
+- 主机侧中段服务已补充以下保护：
+  - session 超时回收与显式 cache 释放
+  - `CUDA_OOM` 时主动回收故障 session
+  - `max_sessions` 并发限制
+  - 单线程 `HTTPServer`，避免 `/v1/session/step` 高频请求持续创建线程
+- 主机侧注意力缓存更新已改为原地写回，不再每个 token 重建整块 K/V cache
+- GQA 计算已移除“物理复制 KV 头”的实现，改为按组直接计算，降低系统内存与显存抖动
+
+### 7.1 最近修复摘要
+
+这次新增的修复主要集中在两条线上：
+
+1. 控制器稳定性
+   - 支持客户端断连后的自动取消与 session 清理
+   - `Qwen3.5-2B` thinking 模式显式禁用，避免已知的长思维链循环问题
+
+2. 主机侧中段服务内存稳定性
+   - session 生命周期改为显式释放 cache，而不是仅依赖字典删除
+   - `Qwen3_5Attention` 的 K/V 更新改为原地 `copy_()` 写回
+   - GQA 不再把 2 个 KV heads 扩成 8 个 query heads 的物理副本
+   - HTTP 服务从 `ThreadingHTTPServer` 改为 `HTTPServer`，避免每 token step 产生线程级系统内存膨胀
 
 ### 1. 环境准备
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 import onnxruntime as ort
 
@@ -60,22 +62,32 @@ class OnnxSplitEngine(SplitEngine):
         self.suffix_feed: dict[str, np.ndarray] | None = None
         self._prefix_has_pos: bool = True
         self._suffix_has_pos: bool = True
+        self._load_lock = threading.Lock()
+        self._loaded = False
 
     def load(self) -> None:
-        self.prefix_sess = ort.InferenceSession(self.prefix_onnx, providers=["CPUExecutionProvider"])
-        self.suffix_sess = ort.InferenceSession(self.suffix_onnx, providers=["CPUExecutionProvider"])
-        p_inputs = {i.name for i in self.prefix_sess.get_inputs()}
-        s_inputs = {i.name for i in self.suffix_sess.get_inputs()}
-        self._prefix_has_pos = "position" in p_inputs
-        self._suffix_has_pos = "position" in s_inputs
+        if self._loaded:
+            return
+        with self._load_lock:
+            if self._loaded:
+                return
+            self.prefix_sess = ort.InferenceSession(self.prefix_onnx, providers=["CPUExecutionProvider"])
+            self.suffix_sess = ort.InferenceSession(self.suffix_onnx, providers=["CPUExecutionProvider"])
+            p_inputs = {i.name for i in self.prefix_sess.get_inputs()}
+            s_inputs = {i.name for i in self.suffix_sess.get_inputs()}
+            self._prefix_has_pos = "position" in p_inputs
+            self._suffix_has_pos = "position" in s_inputs
+            self._loaded = True
 
     def close(self) -> None:
         self.prefix_sess = None
         self.suffix_sess = None
         self.prefix_feed = None
         self.suffix_feed = None
+        self._loaded = False
 
     def start_session(self) -> None:
+        self.load()
         self.prefix_feed = _zero_cache_np(self.model_spec, self.prefix_nl_dn, self.prefix_nl_ga,
                                            self.max_len)
         self.suffix_feed = _zero_cache_np(self.model_spec, self.suffix_nl_dn, self.suffix_nl_ga,

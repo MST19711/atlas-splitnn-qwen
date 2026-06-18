@@ -20,8 +20,11 @@ class ChatCompletionRequest(BaseModel):
     messages: list[ChatMessage]
     stream: bool = False
     max_tokens: int = Field(default=64, ge=1, le=1024)
-    temperature: float = 0.7
-    top_k: int = Field(default=40, ge=0, le=512)
+    temperature: float | None = None
+    top_k: int | None = Field(default=None, ge=0, le=512)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    presence_penalty: float | None = Field(default=None, ge=0.0, le=2.0)
+    repetition_penalty: float | None = Field(default=None, ge=0.0, le=2.0)
     stop: str | list[str] | None = None
     enable_thinking: bool = False
 

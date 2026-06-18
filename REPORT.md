@@ -14,6 +14,8 @@
 6. [阶段五：SplitNN 控制器与 OpenAI 接口](#阶段五splitnn-控制器与-openai-接口)
 7. [解决的关键工程问题](#解决的关键工程问题)
 8. [阶段六：SplitNN 通用化](#阶段六splitnn-通用化)
+9. [阶段七：板端参数绑定与 OpenAI 控制器落地](#阶段七板端参数绑定与-openai-控制器落地)
+10. [阶段八：断连回收与服务器内存异常修复](#阶段八断连回收与服务器内存异常修复)
 
 ---
 
@@ -1037,9 +1039,423 @@ S-state（DeltaNet recurrent state）的正确 shape 为 `(1, num_v_heads, head_
 ### 当前局限
 
 1. **板端 decode 仍有提升空间**：4B 16K 当前 1.6 tok/s，瓶颈转移到中间段服务器 + 网络延迟 + ACL 调度开销。Head OM 已从 557ms 优化至 109ms（ATC 重编译修复）
-2. **板端 SSE 流式未修复**：板端 OM 后端 SSE 流式收尾问题仍然存在
+2. **板端 SSE 流式问题已在后续阶段七修复**：本小节对应的 4B 原型阶段里仍存在流式收尾问题，但不再代表项目当前最新状态
 3. **全模型 KVCache 未更新**：`export_qwen35_kvcache.py` 仍使用硬编码的 0.8B 常量，暂不适用于 4B
 4. **OM 模型不含 position 输入时的适配**：已通过 `nl_ga > 0` 条件判断修复（仅 GQA 层需要 position）
+
+## 阶段七：板端参数绑定与 OpenAI 控制器落地
+
+这一阶段的目标与前一阶段不同：不是继续扩展 4B 原型，而是以最小改动让开发板上的 OpenAI 兼容控制器真正可启动、可调用、可生成文本。
+
+最终采用的方案是：
+
+- 主机侧运行 `Qwen3.5-2B` 的全部 24 层 Transformer 主干，`--split 0,24`
+- 开发板仅保留：
+  - `embedding`
+  - tied `lm_head`
+  - OpenAI 兼容控制器
+- 控制器外部接口不变，仍然通过：
+  - `run_prefix()`
+  - `remote_middle.step()`
+  - `run_suffix()`
+ 进行编排
+
+### 为什么选择 `0/24/0` 参数绑定
+
+原始的板端 `prefix.om + suffix.om` 方案虽然接口清晰，但存在两个实际问题：
+
+1. 开发板端的前后段 `.om` 会额外占用大量内存
+2. `embedding` 与 `lm_head` 在 Qwen3.5 中本质是 tied weight，分成两个独立 OM 会破坏“只保留一份权重”的优化目标
+
+因此这一阶段采用了“外部接口不变，内部语义切换”的做法：
+
+- `run_prefix()` 不再表示“prefix transformer 段”，而改为“embedding lookup”
+- `run_suffix()` 不再表示“suffix transformer 段”，而改为“tied lm_head”
+
+### 实现方式
+
+#### 1. 板端资产格式
+
+新增板端参数绑定资产目录：
+
+```text
+qwen3.5_2b_bound_embed_head/
+├── tied_weight.bin
+├── final_norm_weight.bin
+└── bound_embed_head.metadata.json
+```
+
+对应导出脚本：
+
+- `scripts/export_qwen35_bound_embed_head.py`
+
+元数据中显式要求：
+
+- `prefix_end = 0`
+- `suffix_start = total_layers`
+
+即整个主干都在服务器侧执行。
+
+#### 2. `OmSplitEngine` 扩展为双模式
+
+在不改控制器调用方式的前提下，将板端 `OmSplitEngine` 扩展为两种模式：
+
+- `om_split`
+  - 旧模式
+  - 仍执行 `prefix.om + suffix.om`
+- `bound_embed_head`
+  - 新模式
+  - `run_prefix()` 直接做 embedding lookup
+  - `run_suffix()` 做 tied `lm_head`
+
+这使得控制器仍可复用现有 OpenAI API 和 orchestrator 逻辑，而不需要为参数绑定单独写一套协议。
+
+#### 3. 为什么 `run_suffix()` 不能再做 final norm
+
+实现过程中最重要的一次语义校正来自模型代码检查。
+
+最初曾假设 `run_suffix()` 应该执行：
+
+```text
+final norm + tied lm_head
+```
+
+但检查 `Qwen3_5TextModel.forward()` 后确认：
+
+- 服务器返回的 `last_hidden_state` 已经是 **post-final-norm**
+
+因此板端 `run_suffix()` 正确语义应为：
+
+```text
+tied lm_head only
+```
+
+修正后，与 HF 结果的数值对比变为：
+
+- embedding: `max_diff = 0`
+- head: `max_diff ≈ 0.003906`
+- `argmax_match = True`
+
+### 遇到的问题与解决方案
+
+#### 问题 1：控制器可启动，但真正推理时长时间卡住
+
+板端 OpenAI 控制器修复启动后，第一次端到端实验中发现：
+
+- `/healthz` 正常
+- 中段服务器联通正常
+- 但真实生成请求会长时间不返回
+
+排查后确认不是控制器挂死，而是板端 `run_suffix()` 使用 CPU `numpy` 执行：
+
+```text
+(1, 2048) x (2048, 248320)
+```
+
+这一步是全词表矩阵乘法，开发板 CPU 无法在可接受时间内完成，因此看起来像“卡住”。
+
+**解决方案：**
+
+不再让 `run_suffix()` 走 CPU，而是在开发板上执行 ACL single-op `MatMul`。
+
+#### 问题 2：ACL Python API 能调，但 `acl.op.execute("MatMul", ...)` 返回 `100024`
+
+在开发板 Python 侧摸索 ACL 算子级接口时，最初的最小样例持续返回：
+
+```text
+100024 = ACL_ERROR_OP_NOT_FOUND
+```
+
+原因并不是张量 shape 错，而是：
+
+- `aclopSetModelDir("op_models")` 只告诉 ACL 去哪里找“单算子模型”
+- 它不会自动生成 `MatMul` 的单算子 `.om`
+
+**解决方案：**
+
+先在主机上的 CANN 7 容器中通过：
+
+```bash
+atc --singleop=test_data/config/acl_op.json --output=op_models
+```
+
+为真实 head shape：
+
+```text
+[1, 2048] x [248320, 2048]^T -> [1, 248320]
+```
+
+编译出单算子 `MatMul` 模型，再同步到开发板：
+
+```text
+qwen3.5_2b_bound_embed_head/op_models/
+└── 0_MatMul_1_2_1_2048_1_2_248320_2048_1_2_1_248320.om
+```
+
+编译后最小样例数值验证通过，说明 ACL 单算子路径可用。
+
+#### 问题 3：非流式能跑，流式请求会在 `acl.rt.memcpy(hidden)` 处报错
+
+修复 CPU head 后，非流式请求已经能正常生成，但流式请求最初会报：
+
+```text
+OmEngineError: acl.rt.memcpy(hidden) failed, ret=107002
+```
+
+原因有两层：
+
+1. 早期一次问题是共享 ACL stream/buffer 被并发踩踏
+2. 更本质的问题是 FastAPI 的 `StreamingResponse` 会将生成器放到 worker thread 中执行，而 ACL context 与线程绑定
+
+也就是说：
+
+- 非流式路径在主线程里跑，没有问题
+- 流式路径切到线程池后，原来线程里的 ACL context 没有自动带过去
+
+**解决方案：**
+
+1. 给 ACL head 执行器增加互斥锁，串行化共享 stream/buffer
+2. 在 `_ACLRuntime` 中保存初始化线程的 ACL context
+3. 在 `start_session()`、`run_prefix()`、`run_suffix()` 以及 head executor `run()` 入口处显式调用：
+
+```python
+acl.rt.set_context(saved_context)
+```
+
+修复后，流式请求可完整输出：
+
+- role chunk
+- 多个 content chunk
+- `finish_reason`
+- `[DONE]`
+
+#### 问题 4：控制器启动时卡在 `Waiting for application startup`
+
+最初用户报告的问题是开发板上的 OpenAI 控制器无法启动，卡在：
+
+```text
+INFO:     Started server process
+INFO:     Waiting for application startup
+```
+
+这次实际排查发现，根因不是 FastAPI 本身，而是板端 OM 路径和运行模式与当前部署目标不一致：
+
+- 旧的控制器默认仍以 `prefix.om + suffix.om` 语义初始化引擎
+- 但当前部署目标是 `0/24/0` 参数绑定，不再具备原来的前后段 OM
+
+**解决方案：**
+
+新增板端启动脚本：
+
+- `board/run_openai_split_controller_bound_2b.sh`
+
+固定按以下参数启动：
+
+- `--engine om`
+- `--om-mode bound_embed_head`
+- `--split 0,24`
+- `--bound-asset-dir /root/slm_deploy/qwen3.5_2b_bound_embed_head`
+
+并让控制器在 `bound_embed_head` 模式下从 `bound_embed_head.metadata.json` 加载模型规格，而不是再假设一定存在 prefix metadata。
+
+### 最终验证结果
+
+#### 1. 健康检查
+
+板端控制器：
+
+```text
+GET /healthz -> ok=true
+```
+
+且能同时看到：
+
+- `engine_loaded = true`
+- `remote.ok = true`
+
+说明板端控制器与主机中段服务均已就绪。
+
+#### 2. 非流式生成
+
+开发板本机请求：
+
+```text
+POST /v1/chat/completions
+stream=false
+```
+
+能够正常返回文本，例如：
+
+```text
+你好
+```
+
+以及更长的回答，例如：
+
+```text
+我是 Qwen3.5，由阿里巴巴最新推出的通义千问大语言模型。...
+```
+
+#### 3. 流式生成
+
+开发板本机 `curl -N` 验证可完整收到：
+
+```text
+data: role chunk
+data: content chunk
+data: content chunk
+...
+data: finish_reason
+data: [DONE]
+```
+
+这说明 OpenAI 兼容接口已经不仅能启动，而且能在 SplitNN 路径下完成真实文本生成。
+
+### 本阶段结论
+
+这一阶段完成后，项目状态从“SplitNN 原型和若干离线验证脚本可用”推进到了“开发板 OpenAI 控制器可实际部署并生成文本”。
+
+其关键意义在于：
+
+1. 控制器外部协议保持不变，前端可以直接按 OpenAI 兼容方式接入
+2. 板端从重 `.om` 前后段切换为轻量参数绑定实现，内存压力显著下降
+3. 流式与非流式都已联调通过
+4. `Qwen3.5-2B split 0/24/0` 已成为当前最可落地的板端 SplitNN 路径
+
+## 阶段八：断连回收与服务器内存异常修复
+
+在阶段七打通“板端 OpenAI 控制器 + 主机中段服务 + 参数绑定”之后，新的问题开始集中暴露在长时间运行稳定性上。最典型的两类现象是：
+
+1. 请求发起方崩溃、浏览器关闭、命令行 `Ctrl+C` 中断后，控制器仍继续生成
+2. 主机侧 `server/qwen35_split_service.py` 在长时间输出时出现异常的系统内存增长，而且停止推理后不回落
+
+这一阶段的工作重点不是“能不能生成”，而是“出问题后能不能自动停下来，以及长时间运行会不会把主机拖死”。
+
+### 问题一：客户端断开后控制器仍继续生成
+
+#### 现象
+
+- 流式请求中途停止后，控制器仍持续调用 `remote_middle.step()`
+- 主机侧 `v1/health` 中 `sessions` 长时间不回到 `0`
+- 板端控制器有时会被卡死，随后健康检查超时
+
+#### 原因
+
+原来的控制器把生成逻辑写成同步 generator：
+
+- `run_non_stream()` 会一直跑完整个 `_generate()` 才返回
+- `run_stream()` 虽然是 SSE，但内部生成循环仍是同步阻塞
+- `_generate()` 在 `engine.run_prefix()`、`remote_middle.step()`、`engine.run_suffix()` 之间没有断连取消检查
+
+这意味着只要前端断开时控制器正卡在某个 token step 内部，它就完全感知不到连接已经消失。
+
+#### 修复
+
+这次补了两层机制：
+
+1. **FastAPI 层监视连接状态**
+   - 流式请求：持续检查 `request.is_disconnected()`
+   - 非流式请求：单独起异步监视任务，一旦断连就设置取消标志
+
+2. **编排器层支持可取消生成**
+   - 在 prefill 和 decode 的每个 step 前后检查 `cancel_event`
+   - 发现取消后抛出 `OrchestratorCancelled`
+   - 统一回到 `_generate()` 的 `finally`，执行：
+     - `remote_middle.close(session_id)`
+     - `engine.end_session()`
+
+#### 结果
+
+修复后，请求方崩溃或手动中断时，控制器不会再无限继续生成。它不是“立即抢占式停止”，而是“当前 step 完成后自动清理”，这已经足以解决远端 session 长时间残留的问题。
+
+### 问题二：主机侧系统内存异常上涨
+
+#### 现象
+
+在模型接近死循环输出时，观察到：
+
+- 主机 `server` 进程的**系统内存**按约 `30-50 MB/s` 增长
+- 增速远高于“每秒不到 4 token”的正常 KV cache 增长
+- 停止推理后，内存占用也不明显回到基线
+
+这里最关键的观察是：增长主要体现在**系统内存**，而不是单纯显存。
+
+#### 排查过程
+
+这次不是单一 bug，而是几类问题叠加：
+
+1. **session 生命周期过长**
+   - 异常请求如果没显式 `close`，整套中段 cache 会一直存活到超时
+   - 旧默认值是 `300s`
+
+2. **K/V 更新不是原地写回**
+   - 注意力 cache 更新曾使用 `torch.where(...)`
+   - 每个 token 都会构造新的整块 K/V tensor，而不是在原 buffer 上覆盖
+
+3. **GQA 实现物理复制 KV 头**
+   - 原实现会把 `2` 个 KV heads 扩成 `8` 个 query heads 来算
+   - 这会制造不必要的临时大张量
+
+4. **HTTP 层按 token step 建线程**
+   - 旧实现使用 `ThreadingHTTPServer`
+   - `SplitNN` 协议里每个 token 都会发一次 `/v1/session/step`
+   - 高频线程创建/销毁更容易导致系统内存持续膨胀且 RSS 不回落
+
+#### 修复
+
+主机侧中段服务做了四组修复：
+
+1. **session 回收**
+   - `close_session()` 改为显式释放 cache
+   - 超时回收不再只是 `del dict[key]`，而是先清空 session 内部张量引用
+   - `CUDA_OOM` 时立即回收故障 session
+   - 新增 `--max-sessions`
+   - `session-timeout-sec` 默认值从 `300` 降到 `60`
+
+2. **K/V 原地更新**
+   - `torch.where(...)` 改为对 `K/V` buffer 的切片 `copy_()`
+   - 避免每个 token 重建整块缓存
+
+3. **GQA 按组直接计算**
+   - 不再把 KV 头物理展开复制
+   - 改成按 `num_key_value_groups` 分组做注意力计算
+
+4. **HTTP 服务改单线程**
+   - `ThreadingHTTPServer` 改为 `HTTPServer`
+   - 在当前 `max-sessions=1` 的部署方式下，更符合真实使用模式，也更稳定
+
+#### 结果
+
+修复后，这类“系统内存按几十 MB/s 持续上涨”的问题已经消失。剩余的内存波动更符合：
+
+- 单 session 固定 cache
+- PyTorch allocator 的正常缓存行为
+- 请求级临时对象的短时波动
+
+也就是说，当前如果再观察到内存变化，应该优先从“单 session 固定平台”去理解，而不再是“每个 token 持续线性泄漏”。
+
+### 问题三：Qwen3.5-2B thinking 模式不稳定
+
+#### 现象
+
+即使接口链路本身正确，`enable_thinking=true` 仍会出现：
+
+- 很长的思维链
+- 重复、乱码、复读
+- thinking 无法正常闭合
+
+#### 结论
+
+这次排查后确认，这主要是 `Qwen3.5-2B` 模型本身在当前部署下的稳定性问题，而不是 OpenAI 控制器协议 bug。为避免前端误用，控制器现在会直接拒绝 2B 模型的 thinking 路径，要求显式使用 `enable_thinking=false`。
+
+### 本阶段结论
+
+阶段八的关键价值不在“新增功能”，而在于把这条链路从“能演示”推进到“能持续跑”：
+
+1. 断连后不会再留下长期悬挂的生成任务
+2. 主机中段服务不再出现明显的系统内存线性膨胀
+3. session 生命周期、并发上限和异常回收策略更加明确
+4. `Qwen3.5-2B split 0/24/0` 现在已经具备更稳定的实际联调条件
 
 ## 解决的关键工程问题
 

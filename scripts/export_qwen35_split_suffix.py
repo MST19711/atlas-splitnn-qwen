@@ -34,8 +34,6 @@ def main():
     parser.add_argument("--max-len", type=int, default=256)
     parser.add_argument("--split", type=parse_split, default=(4, 20),
                         help="prefix_end,suffix_start  (e.g. 4,20 for 4/16/4)")
-    parser.add_argument("--lm-chunk", type=int, default=0,
-                        help="Chunk hidden_dim for lm_head MatMul (e.g. 1024). 0=no chunking")
     args = parser.parse_args()
 
     model_spec = ModelSpec.from_pretrained(args.model_path)
@@ -50,8 +48,7 @@ def main():
         trust_remote_code=True,
     ).eval().to(torch.float16)
     configure_eager_attention(model)
-    wrapper = SuffixWrapper(model.model, model_spec, split_config, args.max_len,
-                            model.lm_head, args.lm_chunk).eval()
+    wrapper = SuffixWrapper(model.model, model_spec, split_config, args.max_len, model.lm_head).eval()
 
     inames, onames = build_segment_io_names("hidden_states", "logits", nl_dn, nl_ga)
 

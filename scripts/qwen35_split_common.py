@@ -55,15 +55,6 @@ def make_attn_mask(max_len: int, position: torch.Tensor) -> torch.Tensor:
     return bias.masked_fill(~m.unsqueeze(2), 0.0)
 
 
-def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    if n_rep == 1:
-        return x
-    batch, heads, seq_len, dim = x.shape
-    return x[:, :, None, :, :].expand(batch, heads, n_rep, seq_len, dim).reshape(
-        batch, heads * n_rep, seq_len, dim
-    )
-
-
 def _safe_conv_update(
     hidden_states: torch.Tensor,
     conv_state: torch.Tensor,
@@ -165,14 +156,12 @@ def apply_qwen35_patches() -> None:
             self.present_v = v_buf
 
         def update(self, key_states, value_states, layer_idx):
-            length = self._k.shape[2]
-            idx = torch.arange(length, dtype=torch.int64, device=self._k.device)
-            mask = idx.unsqueeze(0).unsqueeze(0).unsqueeze(-1) == self._pos.view(1, 1, 1, 1)
-            new_k = torch.where(mask, key_states, self._k)
-            new_v = torch.where(mask, value_states, self._v)
-            self.present_k = new_k
-            self.present_v = new_v
-            return new_k, new_v
+            pos = int(self._pos.item())
+            self._k[:, :, pos : pos + 1, :].copy_(key_states)
+            self._v[:, :, pos : pos + 1, :].copy_(value_states)
+            self.present_k = self._k
+            self.present_v = self._v
+            return self._k, self._v
 
     def _patched_attn_fwd(
         self,
@@ -205,15 +194,24 @@ def apply_qwen35_patches() -> None:
                 self.layer_idx,
             )
 
+        batch_size, num_query_heads, q_len, _ = query_states.shape
+        num_kv_heads = key_states.shape[1]
         n_rep = self.num_key_value_groups
-        key_states = _repeat_kv(key_states, n_rep)
-        value_states = _repeat_kv(value_states, n_rep)
-
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
+        grouped_query = query_states.view(batch_size, num_kv_heads, n_rep, q_len, self.head_dim)
+        attn_weights = torch.einsum(
+            "bngqd,bnkd->bngqk",
+            grouped_query,
+            key_states,
+        ) * self.scaling
         if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
+            attn_weights = attn_weights + attention_mask.unsqueeze(2)
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = torch.einsum(
+            "bngqk,bnkd->bngqd",
+            attn_weights,
+            value_states,
+        )
+        attn_output = attn_output.reshape(batch_size, num_query_heads, q_len, self.head_dim)
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = attn_output * torch.sigmoid(gate)
@@ -333,14 +331,12 @@ class _AttentionCacheWrapper:
         self.present_v = v_buf
 
     def update(self, key_states, value_states, layer_idx):
-        length = self._k.shape[2]
-        idx = torch.arange(length, dtype=torch.int64, device=self._k.device)
-        mask = idx.unsqueeze(0).unsqueeze(0).unsqueeze(-1) == self._pos.view(1, 1, 1, 1)
-        new_k = torch.where(mask, key_states, self._k)
-        new_v = torch.where(mask, value_states, self._v)
-        self.present_k = new_k
-        self.present_v = new_v
-        return new_k, new_v
+        pos = int(self._pos.item())
+        self._k[:, :, pos : pos + 1, :].copy_(key_states)
+        self._v[:, :, pos : pos + 1, :].copy_(value_states)
+        self.present_k = self._k
+        self.present_v = self._v
+        return self._k, self._v
 
 
 class PrefixWrapper(SegmentRunner):
@@ -365,32 +361,13 @@ class MiddleWrapper(SegmentRunner):
 
 
 class SuffixWrapper(SegmentRunner):
-    def __init__(self, text_model, model_spec: ModelSpec, split_config: SplitConfig,
-                 max_len: int, lm_head, lm_chunk: int = 0):
+    def __init__(self, text_model, model_spec: ModelSpec, split_config: SplitConfig, max_len: int, lm_head):
         start, end = split_config.suffix_range
         super().__init__(text_model, model_spec, start, end, max_len)
         self.lm_head = lm_head
-        self.lm_chunk = lm_chunk
 
     def forward(self, hidden_states, position, *cache_flat):
         hidden, pres_s, pres_c, pres_k, pres_v = self._forward_layers(hidden_states, position, cache_flat)
         hidden = self.model.norm(hidden)
-        if self.lm_chunk <= 0:
-            logits = self.lm_head(hidden)
-        else:
-            # Chunked lm_head: split hidden_dim into chunks to improve NPU tiling
-            W = self.lm_head.weight  # (vocab_size, hidden_size)
-            _, _, hs = hidden.shape
-            start = 0
-            logits = None
-            while start < hs:
-                end = min(start + self.lm_chunk, hs)
-                chunk = hidden[:, :, start:end]
-                chunk_w = W[:, start:end]
-                partial = chunk @ chunk_w.T
-                if logits is None:
-                    logits = partial
-                else:
-                    logits = logits + partial
-                start = end
+        logits = self.lm_head(hidden)
         return (logits, *pres_s, *pres_c, *pres_k, *pres_v)

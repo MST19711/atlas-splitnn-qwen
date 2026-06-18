@@ -26,5 +26,7 @@ docker/*.rpm
 docker/b4_data/
 fusion_result.json
 tmp/
-.pixi-cache/model_dl/
+.pixi-cache/
 model_dl/
+tmp*/
+tmp*
