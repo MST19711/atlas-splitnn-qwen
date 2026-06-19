@@ -17,6 +17,7 @@
 9. [阶段七：板端参数绑定与 OpenAI 控制器落地](#阶段七板端参数绑定与-openai-控制器落地)
 10. [阶段八：断连回收与服务器内存异常修复](#阶段八断连回收与服务器内存异常修复)
 11. [阶段九：纯板端 KV Cache OpenAI API 控制器落地](#阶段九纯板端-kv-cache-openai-api-控制器落地)
+12. [阶段十：SplitNN RMSNorm 修复、Thinking 解禁与 4B 部署](#阶段十splitnn-rmsnorm-修复thinking-解禁与-4b-部署)
 
 ---
 
@@ -1666,6 +1667,72 @@ Qwen3.5 的 `apply_chat_template(enable_thinking=False)` 在格式化 prompt 时
 3. 所有 OpenAI 标准端点（`/healthz`, `/v1/models`, `/v1/chat/completions`）正常工作，支持流式 SSE 和非流式 JSON
 4. 支持的采样参数与 OpenAI API 兼容：`temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty`, `max_tokens`, `stop`, `stream`
 5. 部署链路无需外部 CUDA 主机或网络隧道，开发板独立运行
+
+## 阶段十：SplitNN RMSNorm 修复、Thinking 解禁与 4B 部署
+
+### SplitNN 参数绑定模式 Final RMSNorm 遗漏
+
+阶段七和阶段八落地的 `bound_embed_head`（split 0/N/0）模式存在一个隐蔽 bug：Final RMSNorm 被完全遗漏。
+
+**发现过程**：在测试 2B SplitNN 长文本生成时，模型在几百 token 后出现严重发散——重复、乱码，与正常 KV Cache 推理差异巨大。怀疑切分后推理流程中落下了某个算子。
+
+**排查**：追溯完整的前向传播链路：
+
+- `SuffixWrapper.forward()`（`qwen35_split_common.py:369-373`）：在后段层处理完后，调用 `self.model.norm(hidden)` → `self.lm_head(hidden)`，**包含 Final RMSNorm ✓**
+- `MiddleWrapper.forward()`（`qwen35_split_common.py:358-360`）：仅处理中间 Transformer 层，**不包含 Final RMSNorm**
+- `_BoundEmbedHeadRuntime.run_suffix()`（`om_engine.py`）：直接执行 `hidden @ tied_weight^T`，**不包含 Final RMSNorm ✗**
+
+在 `bound_embed_head` 模式（split 0/N/0）中，所有层都在 middle 段，suffix 为 0 层。中段服务返回的是未归一化的 hidden states，而 `run_suffix()` 未补偿 RMSNorm。
+
+**关键证据**：`final_norm_weight.bin` 在 `load()` 中被加载到内存（第 205 行），但在 `run_suffix()` 中从未被使用。代码注释 "Remote backbone already returns post-final-norm hidden states" 与事实矛盾。
+
+**修复**（`controller/engine/om_engine.py`）：
+- 新增 `_apply_final_norm()` 方法，使用 float32 中间精度
+- 公式：`rms_norm(hidden) * (1.0 + final_norm_weight)`，与 patched `Qwen3_5RMSNorm.forward()` 一致
+- 在 `run_suffix()` 的 ACL MatMul 和 numpy MatMul 两条路径前均调用
+
+**验证**：PyTorch 参考对比，修复后 logits max_diff 从 8.5 降至 0.004，改善 2180×。板端实测，1K token 长文本生成 Stable，不再出现发散。
+
+### 2B Thinking 模式解禁
+
+阶段七和阶段八曾因 2B thinking 模式的不稳定性，在 `runner.py` 中显式禁用了 `splitnn_bound_embed_head` 的 `enable_thinking`。根因正是上述 Final RMSNorm 遗漏——未经归一化的 logits 使 thinking 链极易陷入循环和乱码。
+
+RMSNorm 修复后，移除 thinking 禁用限制，并同步将 `max_tokens` 上限从 1024 提升至 4096。
+
+**测试**：2B 模型 with thinking 解答数学题 "小明有48个苹果，给小红1/3，又给小刚剩下的1/4"：
+- Thinking 链清晰：三步推理，使用 LaTeX 公式
+- 答案正确：24 个苹果
+- 无发散、无复读，正常 `stop` 终止
+
+### 4B 模型 bound_embed_head 部署
+
+将 2B 的 bound_embed_head 策略（0/N/0）推广至 4B 模型（0/32/0）。初次部署后发现推理极慢（~1.1 tok/s），排查发现：
+
+- 4B 的 `op_models/` 为空，`head_executor = None`，后退到 CPU numpy 做 248320×2560 矩阵乘法
+- NPU 仅被用于 mmap 存储 tied_weight，无实际计算负载
+
+**解决方案**：将 ACL single-op MatMul 编译集成进导出流程。
+
+- `export_qwen35_bound_embed_head.py` 新增 `--compile-op` 参数，自动按模型维度生成 `acl_op.json` 并调用 ATC 编译
+- 新增 `scripts/compile_head_matmul.sh` 通用编译脚本，接受任意 `bound_asset_dir`
+- 同一套脚本无差别支持 2B（2048 hidden）和 4B（2560 hidden）
+
+**4B 推理速度**：
+
+| 模型 | 模式 | 速度 |
+|------|------|------|
+| 0.8B | KV Cache 纯板端 | ~4.7 tok/s |
+| 2B | SplitNN 0/24/0 | ~5.3 tok/s |
+| 4B | SplitNN 0/32/0 | ~1.1 tok/s |
+
+4B 速度较慢的原因：32 层全部在 CUDA 主机执行，每 token 需 HTTP 往返传输 hidden state（2560 维 FP16 = 5KB），且 Transformer 计算量翻倍。
+
+### 本阶段结论
+
+1. Final RMSNorm 遗漏 bug 被定位并修复，bound_embed_head 模式长文本生成稳定性大幅提升
+2. 2B thinking 模式解禁，数学推理验证通过
+3. bound_embed_head 策略已推广至 4B，ACL MatMul 编译流程通用化
+4. `--compile-op` 一键完成导出+编译，消除 2B/4B 间的不一致性
 
 ## 解决的关键工程问题
 
