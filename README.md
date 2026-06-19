@@ -83,6 +83,320 @@
 
 ---
 
+## 板端推理架构
+
+以下描述开发板上完整的推理系统架构，包括**控制器中间层**与三种**板端引擎模式**。
+
+### 总体架构
+
+```
+┌─────────────────────────────────────────────────────┐
+│  OpenAI 兼容 API (FastAPI + uvicorn :8000)             │
+│  GET /healthz  GET /v1/models  POST /v1/chat/completions │
+├─────────────────────────────────────────────────────┤
+│  控制器中间层 (controller/)                            │
+│  ├── openai_controller.py    —— API 入口，参数解析      │
+│  ├── schemas.py              —— Pydantic 请求/响应模型  │
+│  ├── generation/runner.py    —— 统一 prefill/decode 循环│
+│  ├── generation/config.py    —— SamplingParams 采样参数 │
+│  ├── generation/strategies.py —— 采样策略               │
+│  ├── modeling/factory.py     —— 后端模型工厂            │
+│  └── tokenization/qwen35.py  —— Tokenizer 适配器        │
+├─────────────────────────────────────────────────────┤
+│  板端引擎 (modeling/ + engine/)                        │
+│  ├── Qwen35KvCacheModel      —— 纯板端 KV Cache        │
+│  ├── SplitNNQwen35Model      —— SplitNN 前后段          │
+│  │   ├── OmSplitEngine       —— ACL OM 执行            │
+│  │   └── RemoteMiddleClient  —— HTTP 远端中段协议       │
+│  └── _ACLSessionRuntime      —— ACL 底层封装            │
+└─────────────────────────────────────────────────────┘
+```
+
+三层职责分明：
+
+- **API 层**：解析请求，路由到对应端点，返回 OpenAI 格式响应
+- **控制器层**：chat template 格式化、prefill/decode 循环、采样、stop 判断——与引擎无关
+- **引擎层**：执行 NPU 推理（ACL），管理设备内存与 cache——与控制逻辑无关
+
+### 控制器-引擎中间层
+
+`controller/modeling/factory.py` 是连接控制器与引擎的关键。通过 `BackendConfig` 数据类描述部署参数，`create_model()` 工厂函数根据 `--backend` 参数选择对应的引擎。
+
+启动命令通用格式：
+
+```bash
+python3 controller/openai_controller.py \
+  --host 0.0.0.0 --port 8000 \
+  --backend <mode> \
+  --model-name <name> \
+  --tokenizer-dir <path> \
+  --max-len <n> \
+  [mode-specific args...]
+```
+
+统一的 OpenAI API 端点：
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/healthz` | GET | 健康检查，含模型加载状态、后端类型、max_len |
+| `/v1/models` | GET | 模型列表（OpenAI 兼容格式） |
+| `/v1/chat/completions` | POST | 对话补全（支持 `stream: true/false`） |
+
+统一的可调参数（所有模式通用）：
+
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `model` | str | — | 模型名，需与 `--model-name` 一致 |
+| `messages` | list | — | 对话历史 `[{"role":"user","content":"..."}]` |
+| `max_tokens` | int | 64 | 最大生成 token 数（上限 1024） |
+| `temperature` | float | 0.7 | 温度，0 = 贪心 |
+| `top_k` | int | 40 | Top-K 采样 |
+| `top_p` | float | 1.0 | Top-P 采样 |
+| `repetition_penalty` | float | 1.0 | 重复惩罚 |
+| `presence_penalty` | float | 0.0 | 存在惩罚 |
+| `stop` | str / list | — | 停止词 |
+| `stream` | bool | false | 是否 SSE 流式 |
+| `enable_thinking` | bool | false | 是否启用 `<think>` 推理链 |
+
+---
+
+### 引擎模式一：纯板端 KV Cache (`qwen35_kvcache_om`)
+
+**最简部署模式**——开发板独立运行全部推理，无需外部 CUDA 主机或网络。
+
+#### 工作原理
+
+```
+┌── 开发板 ──────────────────────────────┐
+│  OpenAI 控制器                            │
+│    ↓                                     │
+│  Qwen35KvCacheModel                      │
+│    ├── Embedding 层（OM 内置）             │
+│    ├── 18 层 DeltaNet（线性注意力 + conv）  │
+│    ├── 6 层 Full Attention（KV Cache）     │
+│    ├── RMSNorm + LM Head（OM 内置）        │
+│    └── _ACLSessionRuntime               │
+│         ├── acl.mdl.load_from_file(.om)  │
+│         ├── 双缓冲 AB/BA dataset          │
+│         └── H2D/D2H memcpy + execute     │
+└──────────────────────────────────────────┘
+```
+
+模型编译为一个完整的 OM 文件（50 输入 / 49 输出），包含全部 24 层 Transformer。`_ACLSessionRuntime` 使用交替双缓冲区管理 DeltaNet 的 S/Cache（18 组）和 Full Attention 的 K/V Cache（6 组）。
+
+#### 启动
+
+```bash
+cd /root/slm_deploy
+bash run_openai_kvcache_controller.sh
+```
+
+等价于：
+
+```bash
+python3 controller/openai_controller.py \
+  --host 0.0.0.0 --port 8000 \
+  --backend qwen35_kvcache_om \
+  --model-name qwen3.5-0.8B-kvcache-om \
+  --model-path /root/slm_deploy \
+  --model-om /root/slm_deploy/qwen3.5_kvcache_max256.om \
+  --tokenizer-dir /root/slm_deploy \
+  --max-len 256
+```
+
+#### 板端必需文件
+
+| 文件 | 用途 |
+|------|------|
+| `controller/`（完整目录） | 控制器 + 模型 + 引擎 + tokenizer |
+| `qwen35_model_spec.py` | ModelSpec 结构定义 |
+| `qwen3.5_kvcache_max256.om` | KV Cache OM 模型（1.9GB） |
+| `config.json` | 模型架构参数 |
+| `tokenizer.json`, `vocab.json`, `merges.txt`, `tokenizer_config.json`, `chat_template.jinja` | Tokenizer |
+| `run_openai_kvcache_controller.sh` | 一键启动脚本 |
+
+#### 可用 OM 模型
+
+| 文件 | 上下文 | 大小 |
+|------|--------|------|
+| `qwen3.5_kvcache_max256.om` | 256 tok | 1.9 GB |
+| `qwen3.5_kvcache_max4096.om` | 4096 tok | 1.9 GB |
+
+切换模型只需修改 `--model-om` 和 `--max-len`。
+
+#### 注意事项
+
+- 模型加载约 **210 秒**（OM 文件从磁盘载入 NPU 内存）
+- prefill 阶段按 prompt 长度逐 token 执行，长 prompt 需数十秒
+- decode 阶段约 200ms/tok（~4.7 tok/s）
+- 异常退出后 NPU 变 Alarm → 必须 `reboot`
+
+---
+
+### 引擎模式二：SplitNN OM (`splitnn_om`)
+
+**将模型切分为三段**，前段和后段在板端 NPU 执行，中段在 CUDA 主机执行。适合需要更大模型或更长上下文的场景。
+
+#### 工作原理
+
+```
+┌── 开发板 ──────────────────┐    ┌── CUDA 主机 ────────────────┐
+│  OpenAI 控制器               │    │  Middle Server (:18080)      │
+│    ↓                        │    │    ↓                         │
+│  SplitNNQwen35Model         │    │  MiddleWrapper               │
+│    ├── OmSplitEngine        │    │    ├── layers[4:20]          │
+│    │   ├── Prefix OM(0-3层) │    │    ├── S/Cache (16组)        │
+│    │   └── Suffix OM(20-23层)│   │    └── K/V Cache (2组)        │
+│    └── RemoteMiddleClient   │    │    SessionState (per-session) │
+│         └── HTTP /v1/session/step │                              │
+│  ────────────SSH隧道:28080─────────────────────────────        │
+└─────────────────────────────┘    └──────────────────────────────┘
+```
+
+每步推理经过三个阶段：
+
+1. **Prefix**（板端 NPU）：Embedding → layers[0:4]，产出 hidden state
+2. **Middle**（CUDA 主机）：HTTP 传输 hidden state → layers[4:20] → 返回 hidden state
+3. **Suffix**（板端 NPU）：layers[20:24] → LM Head → logits
+
+#### 启动
+
+**主机侧**（需要 CUDA GPU）：
+
+```bash
+pixi run python server/qwen35_split_service.py \
+  --host 0.0.0.0 --port 18080 \
+  --model-path model/Qwen3.5-0.8B \
+  --device cuda:0 --max-len 16384 --split 4,20
+```
+
+**建立 SSH 反向隧道**（在开发机上执行）：
+
+```bash
+sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no \
+  -o ExitOnForwardFailure=yes \
+  -N -R 28080:127.0.0.1:18080 \
+  root@192.168.137.100
+```
+
+**板端**启动控制器：
+
+```bash
+cd /root/slm_deploy
+bash run_openai_split_controller_om.sh
+```
+
+等价于：
+
+```bash
+python3 controller/openai_controller.py \
+  --host 0.0.0.0 --port 8000 \
+  --backend splitnn_om \
+  --model-name qwen3.5-split-4-16-4-om \
+  --remote-model-name Qwen3.5-0.8B-split-4-16-4 \
+  --tokenizer-dir /root/slm_deploy \
+  --server-url http://127.0.0.1:28080 \
+  --max-len 16384 \
+  --prefix-om /root/slm_deploy/qwen3.5_split_prefix_max16384.om \
+  --suffix-om /root/slm_deploy/qwen3.5_split_suffix_max16384.om \
+  --checksum
+```
+
+#### 板端必需文件
+
+| 文件 | 用途 |
+|------|------|
+| `controller/` | 控制器 + SplitNN 模型 + OM 引擎 |
+| `qwen35_model_spec.py` | ModelSpec / SplitConfig |
+| `qwen3.5_split_prefix_max16384.om` (+ `.metadata.json`) | 前段 OM（layers 0-3） |
+| `qwen3.5_split_suffix_max16384.om` (+ `.metadata.json`) | 后段 OM（layers 20-23） |
+| Tokenizer 文件 | 同上 |
+
+#### 切分方案说明
+
+模型名 `split-4-16-4` 表示：前段 4 层 / 中段 16 层 / 后段 4 层（共 24 层）。`--split 4,20` 表示 `prefix_end=4, suffix_start=20`（即 layers[0:4] + layers[4:20] + layers[20:24]）。
+
+#### 扩展性
+
+- 支持 `--max-len 16384`（16K 上下文，已验证）
+- 同样模型架构可用于不同尺寸（2B / 4B，替换 OM + 调整 split 参数）
+- `--checksum` 开启 HTTP 传输 CRC32 校验，防止 SSH 隧道误码
+
+---
+
+### 引擎模式三：SplitNN 参数绑定 (`splitnn_bound_embed_head`)
+
+**最极端的切分模式**——板端只承担 Embedding 查表和 LM Head 矩阵乘法（tied weights），所有 24 层 Transformer 在 CUDA 主机执行。
+
+#### 工作原理
+
+```
+┌── 开发板 ──────────────────┐    ┌── CUDA 主机 ────────────────┐
+│  Prefix: 查表 tied_weight    │    │  All 24 Transformer layers   │
+│    token_id → hidden_state  │    │    → 返回 post-norm hidden   │
+│         ↓                   │    │                              │
+│  ───── HTTP step ────────→ │    │                              │
+│         ↓                   │    │                              │
+│  Suffix: hidden @ tied_weight^T │                             │
+│    → logits (ACL MatMul)    │    │                              │
+└─────────────────────────────┘    └──────────────────────────────┘
+```
+
+板端利用 Qwen3.5 模型 **Embedding 和 LM Head 共享权重**（tied weights）的特性，只需在 NPU 上保存一份 `tied_weight.bin`，通过 ACL single-op `MatMul` 执行 LM Head 计算。
+
+#### 启动
+
+与 SplitNN OM 有共同的启动流程，但控制器配置不同：
+
+```bash
+cd /root/slm_deploy
+bash run_openai_split_controller_bound_2b.sh
+```
+
+等价于：
+
+```bash
+python3 controller/openai_controller.py \
+  --host 0.0.0.0 --port 8000 \
+  --backend splitnn_bound_embed_head \
+  --model-name qwen3.5-2b-split-0-24-0-om \
+  --remote-model-name Qwen3.5-2B-split-0-24-0 \
+  --tokenizer-dir /root/slm_deploy/model_2b \
+  --server-url http://127.0.0.1:28080 \
+  --max-len 8192 \
+  --split 0,24 \
+  --bound-asset-dir /root/slm_deploy/qwen3.5_2b_bound_embed_head \
+  --checksum
+```
+
+关键参数 `--split 0,24`：前段 0 层 / 中段 24 层 / 后段 0 层，板端只负责首尾的 embedding + tied head。
+
+#### 板端必需文件
+
+| 文件 | 用途 |
+|------|------|
+| `qwen3.5_2b_bound_embed_head/` | 参数绑定资产目录 |
+| `  ├── tied_weight.bin` | 共享权重（vocab_size × hidden_size，FP16） |
+| `  ├── final_norm_weight.bin` | 最终 RMSNorm 权重 |
+| `  ├── bound_embed_head.metadata.json` | 元数据 |
+| `  └── op_models/` | ACL single-op MatMul 编译产物 |
+
+---
+
+### 三种引擎模式对比
+
+| 维度 | KV Cache 纯板端 | SplitNN OM | SplitNN 参数绑定 |
+|------|:---:|:---:|:---:|
+| 外部依赖 | 无 | CUDA 主机 + SSH 隧道 | CUDA 主机 + SSH 隧道 |
+| 板端 NPU 执行 | 全部 24 层 | 前段 4 层 + 后段 4 层 | Embedding + LM Head |
+| 支持模型 | 0.8B | 0.8B / 4B / 可扩展 | 2B / 可扩展 |
+| 上下文 | 256 / 4096 | 256 / 16384 | 8192 |
+| 板端 OM 大小 | 1.9 GB | ~2.8 GB（前后段合计） | tied_weight 970 MB |
+| 部署复杂度 | 低 | 高 | 中 |
+| 适用场景 | 入门、独立部署 | 大模型、长上下文 | 极致降低板端负载 |
+
+---
+
 ## 快速开始
 
 ### 纯板端部署：Qwen3.5-0.8B KV Cache + OpenAI API（推荐入门）
