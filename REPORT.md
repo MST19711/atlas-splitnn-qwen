@@ -1703,3 +1703,33 @@ ACL 进程被 kill -9 后（尤其 D 状态），NPU 内存无法自动回收。
 ### ACL API 返回值
 
 `acl.mdl.add_dataset_buffer()` 返回 `(ptr, ret)` 而非单个 ret code，需要 `_, ret = ...` 解包。
+
+### SplitNN 参数绑定模式缺少 Final RMSNorm
+
+**现象：** `bound_embed_head` 模式下推理很快发散，几百 token 后出现复读和乱码。
+
+**根因：** `controller/engine/om_engine.py` 的 `_BoundEmbedHeadRuntime.run_suffix()` 中，`final_norm_weight` 虽然被 `load()` 从 `final_norm_weight.bin` 加载到内存，但在 `run_suffix()` 中从未被使用。代码直接执行 `hidden @ tied_weight^T`，跳过了关键的 Final RMSNorm 步骤。
+
+**链路分析：**
+
+| 段 | 是否包含 Final RMSNorm |
+|----|------------------------|
+| `om_split` 模式的 suffix OM | ✅ `SuffixWrapper.forward()` 调用 `model.norm(hidden)` |
+| `MiddleWrapper.forward()`（host 中段服务） | ❌ 仅处理 Transformer 层，不调用 `model.norm` |
+| `_BoundEmbedHeadRuntime.run_suffix()` | ❌ `final_norm_weight` 已加载但从未使用 |
+
+在 `bound_embed_head` 模式下，split 为 `0/N/0`，所有层都在 middle 段。suffix 为 0 层，没有 OM 来补偿 RMSNorm。整个链路中 Final RMSNorm 完全缺失。
+
+**注释错误：** `run_suffix()` 中原注释声称 "Remote backbone already returns post-final-norm hidden states from Qwen3_5TextModel.forward()"，但中间服务器实际使用 `MiddleWrapper`，其 `forward()` 不包含 `model.norm`。
+
+**修复：** 在 `run_suffix()` 的 MatMul 之前，对 hidden state 手动施加 RMSNorm（使用 float32 中间精度保证稳定性）：
+
+```python
+h32 = hidden.astype(np.float32)
+variance = (h32 ** 2).mean(axis=-1, keepdims=True)
+h32 = h32 / np.sqrt(variance + eps)
+h32 = h32 * (1.0 + final_norm_weight)
+hidden = h32.astype(np.float16)
+```
+
+公式与 `qwen35_split_common.py` 中 patched `Qwen3_5RMSNorm.forward()` 一致。PyTorch 参考验证：修复后 logits max_diff 从 8.5 降至 0.004，改善 2180×。

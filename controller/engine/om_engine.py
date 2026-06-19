@@ -236,16 +236,21 @@ class _BoundEmbedHeadRuntime:
 
     def run_suffix(self, hidden_state: np.ndarray, position: int) -> np.ndarray:
         del position
-        if self.tied_weight is None:
+        if self.tied_weight is None or self.final_norm_weight is None:
             raise OmEngineError("bound embed/head assets not loaded")
-        # Remote backbone already returns post-final-norm hidden states from Qwen3_5TextModel.forward().
+        hidden = np.asarray(hidden_state, dtype=np.float16).reshape(1, self.model_spec.hidden_size)
+        hidden = self._apply_final_norm(hidden)
         if self.head_executor is not None:
-            return self.head_executor.run(hidden_state)
-        hidden = np.asarray(hidden_state, dtype=np.float16).reshape(1, 1, self.model_spec.hidden_size)
-        logits = hidden.reshape(1, self.model_spec.hidden_size).astype(
-            np.float16, copy=False
-        ) @ self.tied_weight.T
+            return self.head_executor.run(hidden.ravel())
+        logits = hidden.astype(np.float16, copy=False) @ self.tied_weight.T
         return logits.astype(np.float16, copy=False).reshape(1, 1, self.model_spec.vocab_size)
+
+    def _apply_final_norm(self, hidden: np.ndarray) -> np.ndarray:
+        h32 = hidden.astype(np.float32)
+        variance = (h32 ** 2).mean(axis=-1, keepdims=True)
+        h32 = h32 / np.sqrt(variance + self.model_spec.rms_norm_eps)
+        h32 = h32 * (1.0 + self.final_norm_weight.astype(np.float32).reshape(1, -1))
+        return h32.astype(np.float16)
 
 
 class _ACLRuntime:
