@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +31,8 @@ def main() -> None:
     parser.add_argument("--output-dir", default="om_out/qwen3.5_2b_bound_embed_head")
     parser.add_argument("--split", type=parse_split, default=(0, 24),
                         help="bound mode requires 0/N/0, e.g. 0,24 for 2B")
+    parser.add_argument("--compile-op", action="store_true",
+                        help="compile ACL single-op MatMul via ATC container")
     args = parser.parse_args()
 
     model_spec = ModelSpec.from_pretrained(args.model_path)
@@ -62,6 +65,43 @@ def main() -> None:
     tied_weight.numpy().astype(np.float16).tofile(tied_path)
     final_norm_weight.numpy().astype(np.float16).tofile(norm_path)
     export_bound_embed_head_metadata(model_spec, split_config, str(out_dir))
+
+    # Export ACL single-op MatMul compile config
+    op_dir = out_dir / "op_models"
+    op_dir.mkdir(parents=True, exist_ok=True)
+    acl_op = [
+        {
+            "op": "MatMul",
+            "input_desc": [
+                {"format": "ND", "type": "float16", "shape": [1, model_spec.hidden_size]},
+                {"format": "ND", "type": "float16", "shape": [model_spec.vocab_size, model_spec.hidden_size]},
+            ],
+            "output_desc": [
+                {"format": "ND", "type": "float16", "shape": [1, model_spec.vocab_size]},
+            ],
+            "attr": [
+                {"name": "transpose_x1", "type": "bool", "value": False},
+                {"name": "transpose_x2", "type": "bool", "value": True},
+            ],
+        }
+    ]
+    config_dir = out_dir / "op_models_config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    acl_op_path = config_dir / "acl_op.json"
+    with open(acl_op_path, "w") as f:
+        json.dump(acl_op, f, indent=2)
+    print(f"exported: {acl_op_path}")
+
+    # Compile if requested
+    if args.compile_op:
+        import subprocess
+        compile_script = Path(__file__).resolve().parent / "compile_head_matmul.sh"
+        if not compile_script.exists():
+            raise FileNotFoundError(f"compile_head_matmul.sh not found at {compile_script}")
+        subprocess.check_call(["bash", str(compile_script), str(out_dir)])
+        # Upload compiled OM to op_models dir
+        for om_file in sorted(op_dir.glob("*.om")):
+            print(f"compiled: {om_file} ({om_file.stat().st_size / 1024 / 1024:.1f} MiB)")
 
     # Lightweight sanity check.
     sample_id = 1

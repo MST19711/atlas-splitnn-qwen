@@ -578,47 +578,30 @@ qwen3.5_2b_bound_embed_head/
 
 ### 2. 编译板端 `lm_head` 单算子模型
 
-参数绑定模式下，板端 `run_suffix()` 默认可退回 CPU `numpy`，但为了可用速度，实际部署时应为真实 head shape 编译 ACL single-op `MatMul`：
+参数绑定模式下，板端 `run_suffix()` 默认退回 CPU numpy。为获得可用速度，需为真实 head shape 编译 ACL single-op `MatMul`。
+
+使用导出脚本的 `--compile-op` 一键完成（需要 ATC 容器 `cann-atc-rocky:v7`）：
 
 ```bash
-mkdir -p tmp_singleop_matmul_qwen35_2b_head/run/out/test_data/config
-cat > tmp_singleop_matmul_qwen35_2b_head/run/out/test_data/config/acl_op.json <<'EOF'
-[
-  {
-    "op": "MatMul",
-    "input_desc": [
-      {"format": "ND", "type": "float16", "shape": [1, 2048]},
-      {"format": "ND", "type": "float16", "shape": [248320, 2048]}
-    ],
-    "output_desc": [
-      {"format": "ND", "type": "float16", "shape": [1, 248320]}
-    ],
-    "attr": [
-      {"name": "transpose_x1", "type": "bool", "value": false},
-      {"name": "transpose_x2", "type": "bool", "value": true}
-    ]
-  }
-]
-EOF
+# 2B 模型
+pixi run python scripts/export_qwen35_bound_embed_head.py \
+  --model-path model_dl/Qwen3.5-2B \
+  --output-dir qwen3.5_2b_bound_embed_head \
+  --split 0,24 --compile-op
+
+# 4B 模型
+pixi run python scripts/export_qwen35_bound_embed_head.py \
+  --model-path model_dl/Qwen3.5-4B \
+  --output-dir qwen3.5_4b_bound_embed_head \
+  --split 0,32 --compile-op
 ```
 
-使用现有 CANN 7 容器编译：
+`--compile-op` 会自动根据模型维度生成 `acl_op.json` 并调用 ATC 容器编译。编译产物位于 `<output-dir>/op_models/` 下。
+
+也可单独编译已有资源：
 
 ```bash
-podman run --rm --network=host --http-proxy=false \
-  -e http_proxy= -e https_proxy= -e HTTP_PROXY= -e HTTPS_PROXY= \
-  -v /home/CX_Li/EF_clean:/workspace:Z \
-  -w /workspace/tmp_singleop_matmul_qwen35_2b_head/run/out \
-  localhost/cann-atc-rocky:v7 \
-  bash -lc 'atc --singleop=test_data/config/acl_op.json \
-    --soc_version=Ascend310B4 \
-    --output=op_models'
-```
-
-编译结果示例：
-
-```text
-op_models/0_MatMul_1_2_1_2048_1_2_248320_2048_1_2_1_248320.om
+bash scripts/compile_head_matmul.sh <bound_asset_dir>
 ```
 
 ### 3. 同步到开发板
