@@ -100,3 +100,25 @@ pixi run python scripts/export_qwen35_kvcache.py --max-len 256 --output om_out/q
 
 # ORT 多步验证 → ATC → SCP → board/gen_text_qwen3_kvcache.py / board/gen_text_qwen35_kvcache.py
 ```
+
+## 纯板端 OpenAI API 控制器 (Qwen3.5 KV Cache)
+板端启动脚本: `board/run_openai_kvcache_controller.sh`
+```bash
+# SCP 文件到板端后执行：
+cd /root/slm_deploy && bash run_openai_kvcache_controller.sh
+# 模型加载约 210 秒 (OM ~1.9GB)，就绪后暴露：
+#   GET  http://0.0.0.0:8000/healthz
+#   GET  http://0.0.0.0:8000/v1/models
+#   POST http://0.0.0.0:8000/v1/chat/completions
+```
+- 无需 CUDA 中段服务器，纯板端运行
+- 依赖: fastapi, uvicorn, pydantic, transformers, tokenizers (板端已预装)
+- 需上传: controller/ 目录 + scripts/qwen35_model_spec.py + OM 模型 + config.json + tokenizer 文件
+- 板端必需文件:
+  - `controller/` (完整目录，含 modeling/engine/generation/tokenization)
+  - `scripts/qwen35_model_spec.py`
+  - `qwen3.5_kvcache_max256.om` (OM 模型)
+  - `config.json` (Qwen3.5 模型配置，ModelSpec 读取用)
+  - `tokenizer.json`, `tokenizer_config.json`, `vocab.json`, `merges.txt`, `chat_template.jinja`
+- 重启后首次运行前需确认 NPU 状态 `OK` (npu-smi info)
+- 异常退出后 NPU 会 Alarm → 必须 reboot```

@@ -16,6 +16,7 @@
 8. [阶段六：SplitNN 通用化](#阶段六splitnn-通用化)
 9. [阶段七：板端参数绑定与 OpenAI 控制器落地](#阶段七板端参数绑定与-openai-控制器落地)
 10. [阶段八：断连回收与服务器内存异常修复](#阶段八断连回收与服务器内存异常修复)
+11. [阶段九：纯板端 KV Cache OpenAI API 控制器落地](#阶段九纯板端-kv-cache-openai-api-控制器落地)
 
 ---
 
@@ -1456,6 +1457,124 @@ data: [DONE]
 2. 主机中段服务不再出现明显的系统内存线性膨胀
 3. session 生命周期、并发上限和异常回收策略更加明确
 4. `Qwen3.5-2B split 0/24/0` 现在已经具备更稳定的实际联调条件
+
+## 阶段九：纯板端 KV Cache OpenAI API 控制器落地
+
+### 动机
+
+阶段七和阶段八落地的 SplitNN 控制器需要一台运行 CUDA 中段服务的 x86 主机，以及反向 SSH 隧道连接。这在某些场景下不够方便：
+
+- 需要额外的主机资源和 CUDA 环境
+- 网络依赖使得部署不够自包含
+- SplitNN 的 4/16/4 切分需要维护前缀 OM、后缀 OM 和中段服务三部分
+
+控制器框架（阶段五）从设计之初就支持了 `qwen35_kvcache_om` 后端——纯板端运行完整模型，不需要远端中段服务。但此前从未在板端实际跑通过这条链路。
+
+### 部署架构
+
+```
+开发板 (Atlas 200I DK A2)
+├── FastAPI 控制器 (uvicorn, port 8000)
+│   └── POST /v1/chat/completions
+│   └── GET  /v1/models
+│   └── GET  /healthz
+├── Qwen35KvCacheModel (controller/modeling/kvcache_qwen35.py)
+│   └── _ACLSessionRuntime → ACL API
+│       └── qwen3.5_kvcache_max256.om (1.9GB, 50in/49out)
+└── Qwen35TokenizerAdapter (controller/tokenization/qwen35.py)
+    └── AutoTokenizer + apply_chat_template
+```
+
+与 SplitNN 路径的关键区别：
+
+| 维度 | KV Cache 纯板端 | SplitNN |
+|------|----------------|---------|
+| 外部依赖 | 无 | 需要 CUDA 主机 + SSH 隧道 |
+| 模型规模 | 0.8B 完整模型 | 4B（1/30/1 切分）或 2B（参数绑定）|
+| 上下文 | 256 tok（可扩展至 4096）| 16K tok |
+| 速度 | ~4.7 tok/s | 取决于主机 + 板端 |
+| 部署复杂度 | 低（复制文件 + 启动脚本）| 高（主机、板端两侧配合）|
+
+### 遇到的工程问题
+
+#### 1. 板端文件版本不一致
+
+控制器框架在 x86 开发机上持续迭代，但板端的 `controller/` 目录是之前 SplitNN 部署时上传的旧版本。关键差异：
+
+- `controller/modeling/kvcache_qwen35.py`：板端旧版缺少 `threading.Lock`，在多线程 uvicorn 环境下 ACL 操作无锁保护
+- `controller/` 下存在旧位置的重复文件（`controller/kvcache_qwen35.py`、`controller/om_engine.py`），与正确的子目录结构（`controller/modeling/`、`controller/engine/`）并存，可能导致 import 歧义
+
+**解决方案：** 从 x86 仓库重新同步最新代码，清理旧位置重复文件。
+
+#### 2. NPU 进程残留导致的 Alarm 状态
+
+ACL 初始化成功（`acl.init()` 返回 0，约 2.3s），但后续的 `acl.mdl.load_from_file()` 在连续两次尝试中卡死超时。排查过程：
+
+- `npu-smi info` 显示 `Health: Alarm`，内存 3379/3513 MB 几乎占满
+- `ps aux` 发现之前的 python 进程（PID 6136）仍处于 D 状态（不可中断睡眠）
+- `dmesg` 显示 `sched_wait_for_publish_event` 返回 `err_ret=-512`（事件调度器无响应）
+
+**根因：** 上一次测试中，进程在 ACL 操作中途被 `kill -9` 或超时终止，NPU 驱动未清理上下文，设备进入 Alarm 状态。Per AGENTS.md 第 5 条：NPU 进程被 kill 后驱动不清理 → 必须重启板子。
+
+**解决方案：** 每次异常退出后 `reboot` 开发板，重新开始。
+
+#### 3. 模型加载耗时 204 秒
+
+OM 模型文件约 1.9GB，NPU 从磁盘加载到设备内存需要约 3.5 分钟。在控制器 `lifespan` 钩子中同步加载，uvicorn 在此期间不对外服务。
+
+在板端启动流程中表现为：
+```
+INFO: Waiting for application startup.
+... (204s 静默等待)
+INFO: Application startup complete.
+INFO: Uvicorn running on http://0.0.0.0:8000
+```
+
+这属于正常行为，并非卡死。启动后所有 API 端点正常响应。首次请求的 prefill 阶段根据 prompt 长度额外需要数十秒，其后 decode 约 200ms/tok。
+
+#### 4. chat_template 中的 <think> 标签
+
+Qwen3.5 的 `apply_chat_template(enable_thinking=False)` 在格式化 prompt 时会在 assistant 回复前插入 `<think>\n\n</think>\n\n`：
+
+```
+<|im_start|>user
+你好<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+```
+
+这在干跑测试时首次发现——`format_messages` 返回的字符串包含了这些空 think 标签，增加了 prompt token 数量但本身不影响生成质量。对 0.8B 模型，thinking 模式已默认关闭（`enable_thinking=False`）。
+
+#### 5. tokenizer 适配器的消息类型要求
+
+`Qwen35TokenizerAdapter.format_messages()` 期望接收具有 `.role` 和 `.content` 属性的 Pydantic 对象（`ChatMessage`），而非纯 `dict`。测试脚本中误用 `{"role": "user", "content": "..."}` 导致 `AttributeError: 'dict' object has no attribute 'role'`。
+
+修正为 `ChatMessage(role="user", content="...")` 后正常。
+
+### 验证结果
+
+| 测试用例 | 输入 | 输出 | 评价 |
+|---------|------|------|------|
+| 简单数学 | `1+1=?` | `2` | ✅ |
+| 地理知识 | `中国的首都是哪里？` | `北京。` | ✅ |
+| 流式输出 | `你好` | `你好！有什么我可以帮你的吗？` | ✅ SSE 流逐字返回 |
+| 自我介绍 | `介绍一下你自己` | `你好，我是一位大语言模型。我是阿里巴巴集团旗下的通义实验室研发的超大规模多模态大模型...` | 语法流畅，有典型小模型幻觉 |
+| 独立脚本对照 | 同上 | `你好！我是 Qwen3.5，由阿里巴巴通义实验室自主研发的超大规模语言模型。我拥有强大的语言理解、推理、对话...` | 更准确，速度 ~4.7 tok/s |
+
+独立 `gen_text_qwen35_kvcache.py` 和控制器 API 两个路径的输出均确认模型在 NPU 上正确运行，生成的是语法正确、语义通顺的中文自然语言文本。
+
+### 本阶段结论
+
+阶段九填补了纯板端 OpenAI API 部署链路的最后空缺：
+
+1. `qwen35_kvcache_om` 后端已在板端实际验证通过
+2. 一键启动脚本 `run_openai_kvcache_controller.sh` 就位
+3. 所有 OpenAI 标准端点（`/healthz`, `/v1/models`, `/v1/chat/completions`）正常工作，支持流式 SSE 和非流式 JSON
+4. 支持的采样参数与 OpenAI API 兼容：`temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty`, `max_tokens`, `stop`, `stream`
+5. 部署链路无需外部 CUDA 主机或网络隧道，开发板独立运行
 
 ## 解决的关键工程问题
 

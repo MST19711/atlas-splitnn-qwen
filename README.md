@@ -12,7 +12,8 @@
 |------|------|--------|---------|
 | Qwen3 KV Cache | Qwen3-0.6B | 256 tok | 1.5 GB |
 | Qwen3.5 KV Cache | Qwen3.5-0.8B | 256 tok | 1.9 GB |
-| Qwen3.5 KV Cache | Qwen3.5-0.8B | 1024 tok | 1.9 GB |
+| Qwen3.5 KV Cache | Qwen3.5-0.8B | 4096 tok | 2.0 GB |
+| **Qwen3.5 KV Cache + OpenAI API** | **Qwen3.5-0.8B** | **256 tok** | **1.9 GB，纯板端独立运行** |
 | **Qwen3.5 SplitNN** | **Qwen3.5-4B (1/30/1)** | **16K tok** | **Prefix+Suffix ~2.8 GB** |
 | **Qwen3.5 SplitNN 参数绑定** | **Qwen3.5-2B (0/24/0)** | **8K tok** | **板端共享 tied weight 970MB + 单算子 head OM 14KB** |
 
@@ -53,17 +54,25 @@
 │   ├── gen_text_qwen3_kvcache.py       # Qwen3 KV Cache 推理
 │   ├── gen_text_qwen35_kvcache.py        # Qwen3.5 DeltaNet KV Cache 推理
 │   ├── gen_text_qwen35_splitnn.py        # Qwen3.5 SplitNN 推理（复用 OmSplitEngine）
-│   └── run_openai_split_controller_bound_2b.sh  # 板端 OpenAI 控制器启动脚本（2B 参数绑定）
+│   ├── run_openai_kvcache_controller.sh      # 纯板端 OpenAI 控制器启动脚本（推荐入门）
+│   ├── run_openai_split_controller_bound_2b.sh  # 板端 OpenAI 控制器启动脚本（2B 参数绑定）
 │   └── run_qwen3_kvcache.sh
-├── controller/               # SplitNN 控制器（OpenAI API + 可插拔前后段引擎）
-│   ├── openai_split_controller.py   # FastAPI 入口
+├── controller/               # OpenAI API 控制器（FastAPI + 可插拔后端引擎）
+│   ├── openai_controller.py         # 主入口，支持 --backend qwen35_kvcache_om
+│   ├── schemas.py                   # Pydantic 数据模型 (含 enable_thinking)
 │   ├── orchestrator.py              # 消息编排、采样、生成循环
 │   ├── remote_middle.py             # 与远端中段服务的 HTTP 协议
-│   ├── schemas.py                   # Pydantic 数据模型 (含 enable_thinking)
-│   └── engine/
-│       ├── base.py                  # 引擎抽象基类
-│       ├── onnx_engine.py           # ONNX Runtime 引擎
-│       └── om_engine.py             # OM (NPU) 引擎
+│   ├── modeling/
+│   │   ├── base.py                  # Qwen35Model/Qwen35Session 抽象
+│   │   ├── factory.py               # 模型工厂（kvcache_om / splitnn / bound_embed_head）
+│   │   ├── kvcache_qwen35.py       # 纯板端 KV Cache 模型（ACL 后端）
+│   │   └── splitnn_qwen35.py       # SplitNN 模型（引擎 + 远端中段）
+│   ├── engine/
+│   │   ├── base.py                  # 引擎抽象基类
+│   │   ├── onnx_engine.py           # ONNX Runtime 引擎 (x86 仿真)
+│   │   └── om_engine.py             # OM (NPU) 引擎
+│   ├── generation/                  # 生成循环与采样策略
+│   └── tokenization/                # Qwen3.5 tokenizer 适配器
 ├── docker/                   # ATC 容器构建
 │   └── Containerfile.v2-cann7
 ├── server/                   # CUDA 主机服务
@@ -75,6 +84,141 @@
 ---
 
 ## 快速开始
+
+### 纯板端部署：Qwen3.5-0.8B KV Cache + OpenAI API（推荐入门）
+
+这是最简部署路径——**无需 CUDA 主机、无需远程中段服务**，开发板独立运行完整的 OpenAI 兼容 API。
+
+**前置条件：** 板端需预装 `fastapi`, `uvicorn`, `pydantic`, `transformers`, `tokenizers`, `jinja2`, `markupsafe`, `numpy`。详见下方 [环境准备](#1-环境准备)。
+
+#### 1. 准备板端文件
+
+```bash
+# 上传控制器代码
+sshpass -p 'Mind@123' scp -r -o StrictHostKeyChecking=no \
+  controller/ \
+  root@192.168.137.100:/root/slm_deploy/
+
+# 上传 ModelSpec（无 torch 依赖的结构定义）
+sshpass -p 'Mind@123' scp -o StrictHostKeyChecking=no \
+  scripts/qwen35_model_spec.py \
+  root@192.168.137.100:/root/slm_deploy/scripts/
+
+# 上传 KV Cache OM 模型（约 1.9GB）
+sshpass -p 'Mind@123' scp -o StrictHostKeyChecking=no \
+  om_out/qwen3.5_kvcache_max256.om \
+  root@192.168.137.100:/root/slm_deploy/
+
+# 上传 Qwen3.5 模型配置（ModelSpec 读取 hidden_size/vocab_size 等用）
+sshpass -p 'Mind@123' scp -o StrictHostKeyChecking=no \
+  model/Qwen3.5-0.8B/config.json \
+  root@192.168.137.100:/root/slm_deploy/
+
+# 上传 tokenizer 文件（Qwen3.5 专用，勿与 Qwen3 混用）
+sshpass -p 'Mind@123' scp -o StrictHostKeyChecking=no \
+  model/Qwen3.5-0.8B/tokenizer.json \
+  model/Qwen3.5-0.8B/tokenizer_config.json \
+  model/Qwen3.5-0.8B/vocab.json \
+  model/Qwen3.5-0.8B/merges.txt \
+  model/Qwen3.5-0.8B/chat_template.jinja \
+  root@192.168.137.100:/root/slm_deploy/
+
+# 上传启动脚本（如首次部署）
+sshpass -p 'Mind@123' scp -o StrictHostKeyChecking=no \
+  board/run_openai_kvcache_controller.sh \
+  root@192.168.137.100:/root/slm_deploy/
+sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no root@192.168.137.100 \
+  'chmod +x /root/slm_deploy/run_openai_kvcache_controller.sh'
+```
+
+板端最终文件结构：
+
+```text
+/root/slm_deploy/
+├── controller/                  # 控制器代码（完整目录）
+│   ├── openai_controller.py
+│   ├── modeling/kvcache_qwen35.py
+│   ├── engine/om_engine.py
+│   └── ...
+├── scripts/qwen35_model_spec.py
+├── qwen3.5_kvcache_max256.om    # KV Cache OM 模型（1.9GB）
+├── config.json                  # Qwen3.5 模型配置
+├── tokenizer.json, vocab.json, merges.txt, tokenizer_config.json, chat_template.jinja
+└── run_openai_kvcache_controller.sh
+```
+
+#### 2. 启动控制器
+
+```bash
+# 登录开发板后执行
+cd /root/slm_deploy
+
+# 前台运行（Ctrl+C 停止）
+bash run_openai_kvcache_controller.sh
+
+# 或后台运行
+nohup bash run_openai_kvcache_controller.sh > controller_kvcache.log 2>&1 &
+tail -f controller_kvcache.log
+```
+
+> 模型加载约需 **210 秒**（1.9GB OM 从磁盘加载到 NPU），就绪后日志显示 `Uvicorn running on http://0.0.0.0:8000`。
+
+#### 3. 测试 API
+
+```bash
+# 健康检查
+curl http://127.0.0.1:8000/healthz
+
+# 模型列表
+curl http://127.0.0.1:8000/v1/models
+
+# 非流式对话
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-0.8B-kvcache-om",
+    "messages": [{"role": "user", "content": "你好，介绍一下你自己"}],
+    "max_tokens": 64,
+    "temperature": 0.7,
+    "stream": false
+  }'
+
+# 流式对话
+curl -N http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-0.8B-kvcache-om",
+    "messages": [{"role": "user", "content": "请用中文写一首关于春天的四句诗"}],
+    "max_tokens": 128,
+    "temperature": 0.4,
+    "top_p": 0.85,
+    "top_k": 20,
+    "repetition_penalty": 1.08,
+    "stream": true
+  }'
+```
+
+#### 4. 支持的解码参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `temperature` | float | 0.7 | 温度，0 = 贪心解码 |
+| `top_k` | int | 40 | Top-K 采样 |
+| `top_p` | float | 1.0 | Top-P (nucleus) 采样 |
+| `repetition_penalty` | float | 1.0 | 重复惩罚（1.0 = 无惩罚） |
+| `presence_penalty` | float | 0.0 | 存在惩罚 |
+| `max_tokens` | int | 64 | 最大生成 token 数（上限 1024） |
+| `stream` | bool | false | 是否流式 SSE 返回 |
+| `stop` | str/list | — | 停止词 |
+| `enable_thinking` | bool | false | 是否启用 `<think>` 推理链 |
+
+#### 5. 注意事项
+
+- **启动前确认 NPU 状态**：`npu-smi info` 显示 `Health: OK`，否则需 `reboot`
+- **异常退出后 NPU 变 Alarm**：ACL 进程被 kill 后驱动不自动清理，必须重启开发板
+- **预填充耗时**：首次请求的 prefill 阶段按 prompt 长度需要数十秒（NPU 逐 token 执行），之后 decode 阶段约 200ms/tok
+- **上下文窗口**：当前 OM 模型为 `max_len=256`。板端另有 `qwen3.5_kvcache_max4096.om`（2.0GB）可支持 4096 窗口
+- **与其他方案的区别**：本路径**不依赖**任何外部 CUDA 服务器或 SSH 隧道，所有推理在 NPU 上完成
 
 ### 新增：Qwen3.5-2B SplitNN 参数绑定链路
 
