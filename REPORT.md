@@ -790,6 +790,97 @@ Board OM prefix/suffix
 
 不过从工程阶段来看，至此 SplitNN 已经进入“部署联调”而不再只是“算子验证”阶段。
 
+### 后继重构：控制器模块化与多后端架构
+
+阶段五的首版控制器虽然功能完整，但其内部结构存在明显问题：API 层（`openai_split_controller.py`，277 行）和编排层（`orchestrator.py`，287 行）是两个巨大的单体文件，采样策略、模型创建、tokenizer 适配、生成循环全部耦合在一起。这导致：
+
+- 新增后端（如纯板端 KV Cache）需要大量重复代码
+- 采样参数默认值散落各处，不一致
+- 模型抽象不统一，SplitNN 和 KV Cache 路径各自为政
+- 无法为独立模块编写单元测试
+
+后续的重构将这些单体文件拆分为模块化结构：
+
+#### 新模块布局
+
+```
+controller/
+├── openai_controller.py      # 主入口，FastAPI build_app()（336 行）
+├── openai_split_controller.py # 薄包装，向后兼容（2 行）
+├── schemas.py                # Pydantic 模型（89 行）
+├── remote_middle.py          # 远端中段客户端（99 行）
+├── modeling/                 # 模型抽象层
+│   ├── base.py               # Qwen35Model / Qwen35Session 抽象基类
+│   ├── factory.py            # BackendConfig + create_model() 多后端工厂
+│   ├── kvcache_qwen35.py     # 纯板端 KV Cache ACL 模型
+│   └── splitnn_qwen35.py     # SplitNN 模型（引擎 + 远端中段）
+├── generation/               # 生成控制层
+│   ├── runner.py             # TokenGenerationRunner（prefill/decode 循环）
+│   ├── config.py             # SamplingParams 统一配置
+│   ├── strategies.py         # greedy_select / sample_with_top_k_top_p
+│   └── logits_processors.py  # presence_penalty / repetition_penalty
+├── engine/                   # 推理引擎层（无变化）
+│   ├── base.py
+│   ├── onnx_engine.py
+│   └── om_engine.py          # 重构后 +50/-26 行
+└── tokenization/             # Tokenizer 适配层
+    └── qwen35.py             # Qwen35TokenizerAdapter
+```
+
+#### 关键架构决策
+
+**1. BackendConfig + 模型工厂**
+
+引入 `BackendConfig` 数据类和 `create_model()` 工厂函数，将后端选择从命令行参数映射到具体模型实例：
+
+| 后端 | 命令行参数 | 模型类 | 外部依赖 |
+|------|-----------|--------|---------|
+| `splitnn_om` | `--prefix-om` `--suffix-om` `--server-url` | `SplitNNQwen35Model` | CUDA 主机 |
+| `splitnn_bound_embed_head` | `--bound-asset-dir` `--server-url` | `SplitNNQwen35Model` | CUDA 主机 |
+| `qwen35_kvcache_om` | `--model-om` | `Qwen35KvCacheModel` | 无 |
+| `splitnn_onnx` | `--prefix-onnx` `--suffix-onnx` | `SplitNNQwen35Model` | ORT（仅开发机） |
+
+这使得同一套 API 层可以为三种部署模式服务，且新增后端只需在 `factory.py` 中添加一个分支。
+
+**2. Tokenizer 适配器**
+
+`Qwen35TokenizerAdapter` 从编排层中独立出来，封装了：
+- `format_messages(messages, enable_thinking)` — Pydantic `ChatMessage` → `apply_chat_template`
+- `encode_prompt(text)` — 字符串 → token IDs
+- `decode_tokens(ids)` — token IDs → 字符串
+
+这解决了之前 tokenizer 调用散落在 `orchestrator.py` 和 `openai_split_controller.py` 各处的问题。
+
+**3. SamplingParams + 统一生成循环**
+
+`TokenGenerationRunner.generate()` 成为唯一的生成入口，负责 prefill → decode → stop/eos 完整流程。采样参数通过 `SamplingParams` 统一传递，默认值集中管理，不再分散在控制器和编排层的各处。
+
+**4. 启动脚本参数迁移**
+
+三个 SplitNN 启动脚本的 CLI 接口从旧风格统一为新风格：
+
+```diff
+- exec python3 -u controller/openai_split_controller.py \
+-   --engine om
++ exec python3 -u controller/openai_controller.py \
++   --backend splitnn_om
+```
+
+#### 重构收益
+
+| 维度 | 重构前 | 重构后 |
+|------|--------|--------|
+| 最大单文件行数 | 287（orchestrator.py） | 336（openai_controller.py，含 API 逻辑） |
+| 后端扩展成本 | 需修改多个文件 | 仅需 `factory.py` 一个分支 + 新模型类 |
+| 采样参数一致性 | 默认值分散在两处 | 集中于 `SamplingParams` + `resolve_sampling_params()` |
+| 可测试性 | 无单元测试 | 3 个测试模块（controller / modeling / generation） |
+| 纯板端路径 | 不存在 | `qwen35_kvcache_om` 后端（阶段九落地） |
+
+#### 向后兼容
+
+`openai_split_controller.py` 保留为 2 行薄包装，导入并转发到新的 `openai_controller.py`，确保旧脚本引用不中断。
+
+
 ---
 
 ## 阶段六：SplitNN 通用化

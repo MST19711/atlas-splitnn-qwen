@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import importlib
 import threading
 from pathlib import Path
 
@@ -19,6 +20,28 @@ M, H2D, D2H = 0, 1, 2
 
 class OmEngineError(RuntimeError):
     pass
+
+
+def _import_acl_module():
+    try:
+        return importlib.import_module("acl")
+    except Exception:
+        pass
+
+    import sys
+
+    candidate_paths = [
+        "/usr/local/Ascend/ascend-toolkit/python/site-packages",
+        "/usr/local/Ascend/ascend-toolkit/latest/python/site-packages",
+    ]
+    for path in candidate_paths:
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        try:
+            return importlib.import_module("acl")
+        except Exception:
+            continue
+    return None
 
 
 class _ACLHeadMatmulExecutor:
@@ -454,38 +477,39 @@ class OmSplitEngine(SplitEngine):
             )
             self.bound_runtime.load()
             head_op_model_dir = Path(self.bound_asset_dir) / "op_models"
-            if head_op_model_dir.is_dir() and any(head_op_model_dir.glob("*.om")):
-                try:
-                    import sys
-                    sys.path.insert(0, "/usr/local/Ascend/ascend-toolkit/latest/python/site-packages")
-                    import acl  # type: ignore
-                except Exception:
-                    acl = None
-                if acl is not None:
-                    gc.collect()
-                    self.acl = acl
-                    self.runtime = _ACLRuntime(acl)
-                    self.runtime.init()
-                    self.bound_head_executor = _ACLHeadMatmulExecutor(
-                        acl=acl,
-                        runtime=self.runtime,
-                        op_model_dir=str(head_op_model_dir),
-                        model_spec=self.model_spec,
+            head_om_files = list(head_op_model_dir.glob("*.om")) if head_op_model_dir.is_dir() else []
+            if head_om_files:
+                acl = _import_acl_module()
+                if acl is None:
+                    raise OmEngineError(
+                        "bound_embed_head op_models are present but ACL Python bindings could not be imported. "
+                        "Please start the controller from the Ascend environment "
+                        "(for example by sourcing ascend-toolkit/set_env.sh or using the board run script)."
                     )
-                    assert self.bound_runtime.tied_weight is not None
-                    self.bound_head_executor.load(self.bound_runtime.tied_weight)
-                    self.bound_runtime.attach_head_executor(self.bound_head_executor)
+                gc.collect()
+                self.acl = acl
+                self.runtime = _ACLRuntime(acl)
+                self.runtime.init()
+                self.bound_head_executor = _ACLHeadMatmulExecutor(
+                    acl=acl,
+                    runtime=self.runtime,
+                    op_model_dir=str(head_op_model_dir),
+                    model_spec=self.model_spec,
+                )
+                assert self.bound_runtime.tied_weight is not None
+                self.bound_head_executor.load(self.bound_runtime.tied_weight)
+                self.bound_runtime.attach_head_executor(self.bound_head_executor)
             return
         if self.mode != "om_split":
             raise OmEngineError(f"unsupported om engine mode: {self.mode}")
         if not self.prefix_om or not self.suffix_om:
             raise OmEngineError("om_split mode requires prefix_om and suffix_om")
-        try:
-            import sys
-            sys.path.insert(0, "/usr/local/Ascend/ascend-toolkit/latest/python/site-packages")
-            import acl  # type: ignore
-        except Exception as exc:  # noqa: BLE001
-            raise OmEngineError(f"failed to import acl: {exc}") from exc
+        acl = _import_acl_module()
+        if acl is None:
+            raise OmEngineError(
+                "failed to import acl. Please start the controller from the Ascend environment "
+                "(for example by sourcing ascend-toolkit/set_env.sh or using the board run script)."
+            )
         gc.collect()
         self.acl = acl
         self.runtime = _ACLRuntime(acl)

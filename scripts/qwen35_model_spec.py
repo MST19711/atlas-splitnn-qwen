@@ -36,37 +36,72 @@ class ModelSpec:
 
     @classmethod
     def from_pretrained(cls, model_path: str) -> "ModelSpec":
-        from transformers import AutoConfig
+        try:
+            from transformers import AutoConfig
 
-        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        if hasattr(config, "text_config"):
-            tc = config.text_config
-        else:
-            tc = config
+            config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+            tc = config.text_config if hasattr(config, "text_config") else config
+            data = {
+                "hidden_size": tc.hidden_size,
+                "vocab_size": tc.vocab_size,
+                "num_hidden_layers": tc.num_hidden_layers,
+                "num_attention_heads": tc.num_attention_heads,
+                "num_key_value_heads": tc.num_key_value_heads,
+                "head_dim": tc.head_dim,
+                "intermediate_size": tc.intermediate_size,
+                "linear_num_key_heads": tc.linear_num_key_heads,
+                "linear_num_value_heads": tc.linear_num_value_heads,
+                "linear_key_head_dim": tc.linear_key_head_dim,
+                "linear_value_head_dim": tc.linear_value_head_dim,
+                "linear_conv_kernel_dim": tc.linear_conv_kernel_dim,
+                "full_attention_interval": getattr(tc, "full_attention_interval", 4),
+                "rms_norm_eps": getattr(tc, "rms_norm_eps", 1e-6),
+            }
+        except Exception:
+            config_path = Path(model_path) / "config.json"
+            with open(config_path) as f:
+                raw = json.load(f)
+            tc = raw.get("text_config", raw)
+            data = {
+                "hidden_size": tc["hidden_size"],
+                "vocab_size": tc["vocab_size"],
+                "num_hidden_layers": tc["num_hidden_layers"],
+                "num_attention_heads": tc["num_attention_heads"],
+                "num_key_value_heads": tc["num_key_value_heads"],
+                "head_dim": tc["head_dim"],
+                "intermediate_size": tc["intermediate_size"],
+                "linear_num_key_heads": tc["linear_num_key_heads"],
+                "linear_num_value_heads": tc["linear_num_value_heads"],
+                "linear_key_head_dim": tc["linear_key_head_dim"],
+                "linear_value_head_dim": tc["linear_value_head_dim"],
+                "linear_conv_kernel_dim": tc["linear_conv_kernel_dim"],
+                "full_attention_interval": tc.get("full_attention_interval", 4),
+                "rms_norm_eps": tc.get("rms_norm_eps", 1e-6),
+            }
 
         layer_types = []
-        interval = getattr(tc, "full_attention_interval", 4)
-        for i in range(tc.num_hidden_layers):
+        interval = data["full_attention_interval"]
+        for i in range(data["num_hidden_layers"]):
             if (i + 1) % interval == 0:
                 layer_types.append("full_attention")
             else:
                 layer_types.append("linear_attention")
 
         return cls(
-            hidden_size=tc.hidden_size,
-            vocab_size=tc.vocab_size,
-            num_hidden_layers=tc.num_hidden_layers,
-            num_attention_heads=tc.num_attention_heads,
-            num_key_value_heads=tc.num_key_value_heads,
-            head_dim=tc.head_dim,
-            intermediate_size=tc.intermediate_size,
-            linear_num_key_heads=tc.linear_num_key_heads,
-            linear_num_value_heads=tc.linear_num_value_heads,
-            linear_key_head_dim=tc.linear_key_head_dim,
-            linear_value_head_dim=tc.linear_value_head_dim,
-            linear_conv_kernel_dim=tc.linear_conv_kernel_dim,
+            hidden_size=data["hidden_size"],
+            vocab_size=data["vocab_size"],
+            num_hidden_layers=data["num_hidden_layers"],
+            num_attention_heads=data["num_attention_heads"],
+            num_key_value_heads=data["num_key_value_heads"],
+            head_dim=data["head_dim"],
+            intermediate_size=data["intermediate_size"],
+            linear_num_key_heads=data["linear_num_key_heads"],
+            linear_num_value_heads=data["linear_num_value_heads"],
+            linear_key_head_dim=data["linear_key_head_dim"],
+            linear_value_head_dim=data["linear_value_head_dim"],
+            linear_conv_kernel_dim=data["linear_conv_kernel_dim"],
             full_attention_interval=interval,
-            rms_norm_eps=getattr(tc, "rms_norm_eps", 1e-6),
+            rms_norm_eps=data["rms_norm_eps"],
             layer_types=layer_types,
         )
 

@@ -15,11 +15,10 @@ else
 fi
 
 cd /root/slm_deploy
-exec python3 -u controller/openai_split_controller.py \
+exec python3 -u controller/openai_controller.py \
   --host 0.0.0.0 \
   --port 8000 \
-  --engine om \
-  --om-mode bound_embed_head \
+  --backend splitnn_bound_embed_head \
   --model-name qwen3.5-2b-split-0-24-0-om \
   --remote-model-name Qwen3.5-2B-split-0-24-0 \
   --tokenizer-dir /root/slm_deploy/model_2b \
