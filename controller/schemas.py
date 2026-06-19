@@ -19,7 +19,7 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
     stream: bool = False
-    max_tokens: int = Field(default=64, ge=1, le=1024)
+    max_tokens: int = Field(default=64, ge=1, le=4096)
     temperature: float | None = None
     top_k: int | None = Field(default=None, ge=0, le=512)
     top_p: float | None = Field(default=None, ge=0.0, le=1.0)

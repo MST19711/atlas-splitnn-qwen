@@ -79,11 +79,6 @@ class TokenGenerationRunner:
     ) -> Generator[GenerationStep, None, None]:
         if not prompt_ids:
             raise GenerationError("empty prompt ids")
-        if params.enable_thinking and self.model.info.backend_kind == "splitnn_bound_embed_head":
-            raise GenerationError(
-                "Qwen3.5-2B thinking mode is unstable in this deployment and has been disabled. "
-                "Please use enable_thinking=false, or switch to a larger Qwen3.5 model for thinking mode."
-            )
         prompt_ids = prompt_ids[-self.model.info.max_len :]
         think_end_ids = self.tokenizer.encode_prompt("</think>")
         think_end_token_id = think_end_ids[0] if len(think_end_ids) == 1 else None
