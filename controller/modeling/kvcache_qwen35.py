@@ -9,7 +9,7 @@ import numpy as np
 from controller.modeling.base import ModelInfo, Qwen35Model, Qwen35Session
 from scripts.qwen35_model_spec import ModelSpec
 
-M, H2D, D2H = 0, 1, 2
+from controller.engine.constants import M, H2D, D2H
 
 
 class Qwen35KvCacheError(RuntimeError):
@@ -19,41 +19,6 @@ class Qwen35KvCacheError(RuntimeError):
 def _check(ret: int, msg: str) -> None:
     if ret != 0:
         raise Qwen35KvCacheError(f"{msg} failed, ret={ret}")
-
-
-def _make_dataset(
-    acl,
-    dev_ids,
-    dev_pos,
-    s_src,
-    c_src,
-    k_src,
-    v_src,
-    dev_logits,
-    s_dst,
-    c_dst,
-    k_dst,
-    v_dst,
-    kv_bytes: int,
-):
-    ds_in = acl.mdl.create_dataset()
-    ds_out = acl.mdl.create_dataset()
-    bufs_in, bufs_out = [], []
-    for ptr, sz in [(dev_ids, 8), (dev_pos, 8)]:
-        buf = acl.create_data_buffer(ptr, sz)
-        bufs_in.append(buf)
-        _, ret = acl.mdl.add_dataset_buffer(ds_in, buf)
-        _check(ret, "add input buffer")
-    for ptrs, sz in [(s_src, _s_bytes_from_spec), (c_src, _c_bytes_from_spec), (k_src, kv_bytes), (v_src, kv_bytes)]:
-        for ptr in ptrs:
-            real_size = sz if isinstance(sz, int) else sz()
-            buf = acl.create_data_buffer(ptr, real_size)
-            bufs_in.append(buf)
-            _, ret = acl.mdl.add_dataset_buffer(ds_in, buf)
-            _check(ret, "add cache input buffer")
-    logits_size = acl.mdl.get_output_size_by_index  # placeholder for lint clarity
-    del logits_size
-    return ds_in, ds_out, bufs_in, bufs_out
 
 
 def _s_bytes_from_spec(spec: ModelSpec) -> int:
@@ -291,6 +256,9 @@ class Qwen35KvCacheModel(Qwen35Model):
 
     def close(self) -> None:
         self.runtime.close()
+
+    def is_loaded(self) -> bool:
+        return self.runtime.acl is not None
 
     def create_session(self) -> Qwen35Session:
         return Qwen35KvCacheSession(self.runtime)

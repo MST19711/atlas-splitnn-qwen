@@ -301,3 +301,10 @@ def load_bound_embed_head_metadata(
     split_config = SplitConfig.from_dict(meta["split_config"])
     bound_cfg = BoundEmbedHeadConfig.from_dict(meta["bound_embed_head"])
     return model_spec, split_config, bound_cfg
+
+
+def parse_split(value: str) -> tuple[int, int]:
+    parts = value.split(",")
+    if len(parts) != 2:
+        raise ValueError("split must be 'prefix_end,suffix_start'")
+    return int(parts[0]), int(parts[1])

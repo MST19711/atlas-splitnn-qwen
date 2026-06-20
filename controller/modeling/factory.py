@@ -7,7 +7,7 @@ from controller.modeling.base import Qwen35Model
 from controller.modeling.kvcache_qwen35 import Qwen35KvCacheModel
 from controller.modeling.splitnn_qwen35 import SplitNNQwen35Model
 from controller.remote_middle import RemoteMiddleClient
-from scripts.qwen35_model_spec import ModelSpec, SplitConfig, load_bound_embed_head_metadata, load_metadata
+from scripts.qwen35_model_spec import ModelSpec, SplitConfig, load_bound_embed_head_metadata, load_metadata, parse_split
 
 
 @dataclass
@@ -31,11 +31,6 @@ class BackendConfig:
     model_om: str
 
 
-def parse_split(value: str) -> tuple[int, int]:
-    parts = value.split(",")
-    if len(parts) != 2:
-        raise ValueError("split must be 'prefix_end,suffix_start'")
-    return int(parts[0]), int(parts[1])
 
 
 def make_model_name(model_spec: ModelSpec, split: tuple[int, int], backend: str) -> str:

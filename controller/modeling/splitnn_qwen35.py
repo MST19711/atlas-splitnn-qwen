@@ -74,5 +74,8 @@ class SplitNNQwen35Model(Qwen35Model):
     def close(self) -> None:
         self.engine.close()
 
+    def is_loaded(self) -> bool:
+        return self.engine.is_loaded()
+
     def create_session(self) -> Qwen35Session:
         return SplitNNQwen35Session(self.engine, self.remote_middle)

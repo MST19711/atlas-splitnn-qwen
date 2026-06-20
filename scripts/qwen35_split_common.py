@@ -42,6 +42,7 @@ __all__ = [
     "PrefixWrapper",
     "MiddleWrapper",
     "SuffixWrapper",
+    "HiddenSegmentWrapper",
 ]
 
 _PATCHED = False
@@ -371,3 +372,31 @@ class SuffixWrapper(SegmentRunner):
         hidden = self.model.norm(hidden)
         logits = self.lm_head(hidden)
         return (logits, *pres_s, *pres_c, *pres_k, *pres_v)
+
+
+class HiddenSegmentWrapper(SegmentRunner):
+    """Pure attention segment — no embedding, no norm, no lm head.
+
+    Used in bound_embed_head mode when prefix/suffix attention layers
+    need to be exported as standalone ONNX segments.
+    """
+
+    _segments = {"prefix", "middle", "suffix"}
+
+    def __init__(
+        self, text_model, model_spec: ModelSpec, split_config: SplitConfig,
+        max_len: int, segment: str,
+    ):
+        if segment not in self._segments:
+            raise ValueError(f"segment must be one of {self._segments}, got {segment!r}")
+        if segment == "prefix":
+            start, end = split_config.prefix_range
+        elif segment == "suffix":
+            start, end = split_config.suffix_range
+        else:
+            start, end = split_config.middle_range
+        super().__init__(text_model, model_spec, start, end, max_len)
+
+    def forward(self, hidden_states, position, *cache_flat):
+        hidden, pres_s, pres_c, pres_k, pres_v = self._forward_layers(hidden_states, position, cache_flat)
+        return (hidden, *pres_s, *pres_c, *pres_k, *pres_v)

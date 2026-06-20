@@ -38,7 +38,6 @@ from controller.schemas import (
 from controller.tokenization.qwen35 import Qwen35TokenizerAdapter
 
 MODEL = None
-RUNNER = None
 TOKENIZER = None
 
 
@@ -76,14 +75,25 @@ class OpenAIChatAdapter:
         prompt = self.tokenizer.format_messages(request.messages, enable_thinking=request.enable_thinking)
         return self.tokenizer.encode_prompt(prompt)
 
-    def run_non_stream(self, request: ChatCompletionRequest, cancel_event=None) -> ChatCompletionResponse:
-        request_id = f"chatcmpl-{uuid.uuid4().hex}"
-        created = int(time.time())
+    def generate_steps(
+        self,
+        request: ChatCompletionRequest,
+        cancel_event: threading.Event | None = None,
+    ):
         params = self.resolve_sampling_params(request)
         prompt_ids = self.build_prompt_ids(request)
+        yield from self.runner.generate(prompt_ids, params, cancel_event=cancel_event)
+
+    def run_non_stream(
+        self,
+        request: ChatCompletionRequest,
+        cancel_event: threading.Event | None = None,
+    ) -> ChatCompletionResponse:
+        request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created = int(time.time())
         chunks = []
         finish_reason = "stop"
-        for step in self.runner.generate(prompt_ids, params, cancel_event=cancel_event):
+        for step in self.generate_steps(request, cancel_event=cancel_event):
             if step.delta_text:
                 chunks.append(step.delta_text)
             if step.finish_reason is not None:
@@ -102,7 +112,11 @@ class OpenAIChatAdapter:
             ],
         )
 
-    def run_stream(self, request: ChatCompletionRequest, cancel_event=None):
+    def run_stream(
+        self,
+        request: ChatCompletionRequest,
+        cancel_event: threading.Event | None = None,
+    ):
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         first = ChatCompletionChunk(
@@ -113,9 +127,7 @@ class OpenAIChatAdapter:
             choices=[StreamChoice(index=0, delta=StreamDelta(role="assistant", content=""), finish_reason=None)],
         )
         yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
-        params = self.resolve_sampling_params(request)
-        prompt_ids = self.build_prompt_ids(request)
-        for step in self.runner.generate(prompt_ids, params, cancel_event=cancel_event):
+        for step in self.generate_steps(request, cancel_event=cancel_event):
             if step.delta_text:
                 chunk = ChatCompletionChunk(
                     id=request_id,
@@ -138,7 +150,6 @@ class OpenAIChatAdapter:
 
 
 def build_app(args) -> FastAPI:
-    global MODEL, RUNNER, TOKENIZER
     config = BackendConfig(
         backend=args.backend,
         model_name=args.model_name,
@@ -163,10 +174,10 @@ def build_app(args) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        global MODEL, RUNNER, TOKENIZER
+        global MODEL, TOKENIZER
         MODEL = model
         TOKENIZER = tokenizer
-        RUNNER = OpenAIChatAdapter(model=model, tokenizer=tokenizer)
+        app.state.runner = OpenAIChatAdapter(model=model, tokenizer=tokenizer)
         app.state.model_loaded = False
         app.state.model_load_error = None
         if model.info.backend_kind == "qwen35_kvcache_om":
@@ -190,13 +201,7 @@ def build_app(args) -> FastAPI:
     def is_model_loaded() -> bool:
         if bool(getattr(app.state, "model_loaded", False)):
             return True
-        runtime = getattr(model, "runtime", None)
-        if runtime is not None and getattr(runtime, "acl", None) is not None:
-            return True
-        engine = getattr(model, "engine", None)
-        if engine is not None and bool(getattr(engine, "_loaded", False)):
-            return True
-        return False
+        return model.is_loaded()
 
     def ensure_model_loaded() -> None:
         if is_model_loaded():
@@ -242,8 +247,10 @@ def build_app(args) -> FastAPI:
 
                     def worker() -> None:
                         try:
-                            for chunk in RUNNER.run_stream(request, cancel_event=cancel_event):
+                            for chunk in app.state.runner.run_stream(request, cancel_event=cancel_event):
                                 out_queue.put(("chunk", chunk))
+                        except GenerationCancelled:
+                            out_queue.put(("cancelled", None))
                         except Exception as exc:  # noqa: BLE001
                             out_queue.put(("error", exc))
                         finally:
@@ -263,6 +270,8 @@ def build_app(args) -> FastAPI:
                             if kind == "chunk":
                                 yield payload
                                 continue
+                            if kind == "cancelled":
+                                break
                             if kind == "error":
                                 if isinstance(payload, GenerationCancelled):
                                     break
@@ -283,7 +292,7 @@ def build_app(args) -> FastAPI:
                 return StreamingResponse(stream_with_disconnect_watch(), media_type="text/event-stream")
 
             cancel_event = threading.Event()
-            response = RUNNER.run_non_stream(request, cancel_event)
+            response = app.state.runner.run_non_stream(request, cancel_event)
             return JSONResponse(content=response.model_dump())
         except OmEngineError as exc:
             app.state.model_load_error = str(exc)

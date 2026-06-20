@@ -5,120 +5,52 @@
 
 ## 开发板
 - `root@192.168.137.100`, 密码 `Mind@123`, Atlas 200I DK A2 (Ascend310B4)
-- **以上为 Atlas 200I DK A2 开发板出厂默认 IP 和密码**
 - SSH: `sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no root@192.168.137.100 '<cmd>'`
 - SCP: `sshpass -p 'Mind@123' scp <local> root@192.168.137.100:/root/slm_deploy/`
-- 板载已装 (出厂): `acl` (CANN 7.0.RC1 runtime 自带)。`numpy`, `transformers`, `tokenizers`, `huggingface-hub` 等需离线安装（板端无外网）
 - NPU 进程被 kill 后驱动不清理 → 重启板子
 
 ## Python 环境
 - pixi 管理 (`pixi run python <script>`)
 - `pixi add <pkg>` (conda), `pixi add --pypi <pkg>` (pip)
-- `pixi.toml` 在项目根
 
-## 项目结构
-```
-scripts/        # ONNX 导出 + ATC 转换 (x86 dev)
-  export_qwen3_kvcache.py     KV Cache 导出 (monkey-patch Qwen3Attention)
-  export_qwen35_kvcache.py      Qwen3.5 KV Cache 导出 (4 个轻量 patch: cat→Where, Trilu, RMSNorm, conv)
-  podman_convert.sh
-board/          # 板载推理 (aarch64)
-  gen_text_qwen3_kvcache.py     Qwen3 KV Cache (max_len=256)
-  gen_text_qwen35_kvcache.py      Qwen3.5 KV Cache (max_len=256, DeltaNet)
-  acl_verify.py           ACL 验证
-docker/
-  Containerfile.v2-cann7  # CANN 7.0 + 310B 内核 (Rocky 9), 镜像: cann-atc-rocky:v7
-model/
-  Qwen3-0.6B/             # Qwen3 模型权重 + tokenizer
-  Qwen3.5-0.8B/           # Qwen3.5 模型权重 + tokenizer
-om_out/ logs/
-```
+## 常用命令
 
-## ATC 转换
+### 导出 ONNX
 ```bash
-# 示例
-MODEL_ONNX=om_out/model.onnx \
-INPUT_SHAPE="name1:d1,d2;name2:d1,d2" \
-IMAGE=localhost/cann-atc-rocky:v7 \
-bash scripts/podman_convert.sh
-```
-- 镜像 `cann-atc-rocky:v7`, CANN 7.0 (实际安装版本 7.1.0.3.220)
-- soc_version=`Ascend310B4`
-- 需传入 INPUT_SHAPE, MODEL_ONNX, 可选 OUTPUT_PREFIX, IMAGE
-
-## ATC 容器构建
-```bash
-# 下载 CANN 7.0.0 安装包到 docker/
-# 1. toolkit: Ascend-cann-toolkit_7.0.0_linux-x86_64.run (1.6GB)
-# 2. kernel: Ascend-cann-kernels-310b-7.0.0-linux.noarch.rpm (351MB)
-podman build --network=host -t localhost/cann-atc-rocky:v7 \
-    -f docker/Containerfile.v2-cann7 docker/
-```
-
-## 当前模型
-| 模型 | 文件 | 速度 | 上下文 |
-|------|------|------|--------|
-| Qwen3 KV Cache | om_out/qwen3_kvcache_max256_cann7.om | 3.6 tok/s | 256 tok |
-| Qwen3.5 KV Cache | om_out/qwen3.5_kvcache_max256.om | 3.7 tok/s | 256 tok |
-
-## 踩坑速查
-1. **ACL API**: `acl.mdl.add_dataset_buffer(ds,buf)` 返回 tuple `(ptr,ret)`, 需 `_, ret = ...`
-2. **TBE ccec**: `tbe/tvm/contrib/ccec.py` 硬编码 `/usr/local/Ascend/CANN-1.84/` → 容器内 symlink
-3. **310B内核**: 必须用 `Ascend-cann-kernels-310b` (非 310P 或其他型号), 否则 soc_version=Ascend310B4 失败
-4. **thinking**: Qwen3 0.6B 需 `enable_thinking=False`
-5. **NPU 泄漏**: kill 后内存不释放 → reboot
-6. **numpy<2**: CANN 7 TBE 不兼容 numpy 2.x, 需要 `pip3 install 'numpy<2'`
-7. **TBE 依赖**: 需 `pip3 install attrs cloudpickle psutil synr tornado` (te 包依赖)
-8. **gcc-c++**: CCE 编译器需要 C++ 标准库头文件, 容器需 `dnf install gcc-c++`
-9. **tokenizer 混乱**: Qwen3 和 Qwen3.5 的 tokenizer 文件互不兼容, SCP 时注意不要互相覆盖
-10. **桌面服务浪费内存**: sddm/xfce4-power-manager/xfce4-notifyd/tumblerd 可安全关闭, 回收 ~120 MiB RAM
-11. **板端 pip 安装必须 `--no-deps`**: `huggingface-hub>=0.34` 依赖 `hf-xet>=1.1.3`，但 PyPI 无 aarch64 wheel。板端 pip.conf 指向豆瓣镜像（无外网不可达），需用 pip wheel 自举安装而非 get-pip.py
-12. **板端需 jinja2**: `apply_chat_template(enable_thinking=False)` 触发 jinja2 模板渲染，板端需额外安装 `jinja2` + `markupsafe`（aarch64 wheel）
-13. **静态窗口模型不可用**: Qwen3 静态窗口 (seq=32) 在 CANN 7.1.0.3.220 + Ascend310B4 下 ATC 编译产物输出错误，相关代码已从仓库移除。仅 KV Cache 方案可用
-14. **ATC INPUT_SHAPE 不能内联展开**: KV Cache 模型的 `INPUT_SHAPE` 包含 50-58 个分号分隔的 shape 定义，shell 内联 `VAR=$(cmd) bash script.sh` 会把分号当命令分隔符。必须 `export INPUT_SHAPE` 后运行脚本
-15. **容器构建需 `--network=host`**: 容器内 `dnf install`/`pip install` 需要联网，不加 `--network=host` 可能导致下载失败
-16. **Qwen3 / Qwen3.5 tokenizer 互不兼容**: Qwen3 用 `vocab.json`+`merges.txt`，Qwen3.5 用 `tokenizer.json`。SCP 时注意不要互相覆盖
-
-## 内存优化 (板端)
-板端 ATLAS 200I DK A2 出厂自带桌面环境, 推理场景可安全关闭:
-```bash
-systemctl stop sddm && systemctl disable sddm
-pkill -f xfce4-power-manager
-pkill -f xfce4-notifyd
-pkill -f tumblerd
-```
-- 不影响: 网络管理 (NetworkManager/systemd-networkd), 文件系统 (udisks2/gvfs), 音频 (pulseaudio/pipewire), 通信 (ModemManager), 更新 (unattended-upgrades)
-- 效果: 665 MiB → 544 MiB, 释放约 121 MiB
-
-## 导出 KV Cache 模型
-```bash
-# Qwen3
-pixi run python scripts/export_qwen3_kvcache.py --max-len 256 --output om_out/qwen3_kvcache_max256.onnx
-
-# Qwen3.5
+# Qwen3.5 KV Cache
 pixi run python scripts/export_qwen35_kvcache.py --max-len 256 --output om_out/qwen3.5_kvcache_max256.onnx
 
-# ORT 多步验证 → ATC → SCP → board/gen_text_qwen3_kvcache.py / board/gen_text_qwen35_kvcache.py
+# Qwen3.5 SplitNN
+pixi run python scripts/export_qwen35_split_prefix.py --model-path model/Qwen3.5-0.8B --max-len 256 --split 4,20 --output om_out/qwen3.5_split_prefix_max256.onnx
+pixi run python scripts/export_qwen35_split_suffix.py --model-path model/Qwen3.5-0.8B --max-len 256 --split 4,20 --output om_out/qwen3.5_split_suffix_max256.onnx
 ```
 
-## 纯板端 OpenAI API 控制器 (Qwen3.5 KV Cache)
-板端启动脚本: `board/run_openai_kvcache_controller.sh`
+### ATC 编译
 ```bash
-# SCP 文件到板端后执行：
-cd /root/slm_deploy && bash run_openai_kvcache_controller.sh
-# 模型加载约 210 秒 (OM ~1.9GB)，就绪后暴露：
-#   GET  http://0.0.0.0:8000/healthz
-#   GET  http://0.0.0.0:8000/v1/models
-#   POST http://0.0.0.0:8000/v1/chat/completions
+export INPUT_SHAPE=$(pixi run python scripts/gen_input_shape.py om_out/model.onnx)
+MODEL_ONNX=om_out/model.onnx bash scripts/podman_convert.sh
 ```
-- 无需 CUDA 中段服务器，纯板端运行
-- 依赖: fastapi, uvicorn, pydantic, transformers, tokenizers (板端已预装)
-- 需上传: controller/ 目录 + scripts/qwen35_model_spec.py + OM 模型 + config.json + tokenizer 文件
-- 板端必需文件:
-  - `controller/` (完整目录，含 modeling/engine/generation/tokenization)
-  - `scripts/qwen35_model_spec.py`
-  - `qwen3.5_kvcache_max256.om` (OM 模型)
-  - `config.json` (Qwen3.5 模型配置，ModelSpec 读取用)
-  - `tokenizer.json`, `tokenizer_config.json`, `vocab.json`, `merges.txt`, `chat_template.jinja`
-- 重启后首次运行前需确认 NPU 状态 `OK` (npu-smi info)
-- 异常退出后 NPU 会 Alarm → 必须 reboot```
+
+### 验证
+```bash
+pixi run python scripts/validate_qwen35_kvcache_ort.py om_out/qwen3.5_kvcache_max256.onnx
+pixi run python -m pytest tests/ -v
+```
+
+### 板端部署
+```bash
+cd /root/slm_deploy && bash run_openai_kvcache_controller.sh  # 纯板端 KV Cache (推荐)
+cd /root/slm_deploy && bash run_openai_split_controller_bound_2b.sh  # 参数绑定 2B
+```
+
+## 关键约束
+- **ATC INPUT_SHAPE 不能内联展开**: 必须 `export INPUT_SHAPE` 后运行
+- **Qwen3/Qwen3.5 tokenizer 互不兼容**: SCP 时注意不要互相覆盖
+- **板端 npu-smi info 必须 OK**, 异常退出后 reboot
+
+## 文档导航
+- [快速开始](./docs/QUICKSTART.md)
+- [架构设计](./docs/ARCHITECTURE.md)
+- [部署详解](./docs/DEPLOYMENT.md)
+- [开发指南](./docs/DEVELOPMENT.md)
+- [踩坑速查](./docs/GOTCHAS.md)

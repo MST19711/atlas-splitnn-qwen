@@ -79,6 +79,9 @@ class OnnxSplitEngine(SplitEngine):
             self._suffix_has_pos = "position" in s_inputs
             self._loaded = True
 
+    def is_loaded(self) -> bool:
+        return self._loaded
+
     def close(self) -> None:
         self.prefix_sess = None
         self.suffix_sess = None

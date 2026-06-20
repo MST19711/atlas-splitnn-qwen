@@ -15,7 +15,7 @@ from scripts.qwen35_model_spec import (
     load_bound_embed_head_metadata,
 )
 
-M, H2D, D2H = 0, 1, 2
+from controller.engine.constants import M, H2D, D2H
 
 
 class OmEngineError(RuntimeError):
@@ -44,7 +44,7 @@ def _import_acl_module():
     return None
 
 
-class _ACLHeadMatmulExecutor:
+class _ACLTiedWeightOps:
     def __init__(self, acl, runtime: "_ACLRuntime", op_model_dir: str, model_spec: ModelSpec):
         self.acl = acl
         self.runtime = runtime
@@ -52,19 +52,34 @@ class _ACLHeadMatmulExecutor:
         self.model_spec = model_spec
         self._lock = threading.Lock()
         self.stream = None
+        self._weight_uploaded = False
+
         self.hidden_desc = None
         self.weight_desc = None
         self.logits_desc = None
         self.hidden_buf = None
         self.weight_buf = None
         self.logits_buf = None
-        self.attr = None
+        self.head_attr = None
+        self.embed_attr = None
         self.hidden_dev = None
         self.weight_dev = None
         self.logits_dev = None
         self.hidden_host = np.empty((1, self.model_spec.hidden_size), dtype=np.float16)
         self.logits_host = np.empty((1, self.model_spec.vocab_size), dtype=np.float16)
-        self._weight_uploaded = False
+
+        self.indices_desc = None
+        self.indices_buf = None
+        self.indices_dev = None
+        self.indices_host = np.empty(1, dtype=np.int32)
+        self.axis_desc = None
+        self.axis_buf = None
+        self.axis_dev = None
+        self.embed_output_desc = None
+        self.embed_output_buf = None
+        self.embed_output_dev = None
+        self.embed_output_host = np.empty((1, self.model_spec.hidden_size), dtype=np.float16)
+        self._embed_available = False
 
     def _check(self, ret: int, msg: str) -> None:
         if ret != 0:
@@ -102,13 +117,72 @@ class _ACLHeadMatmulExecutor:
         self.weight_buf = self.acl.create_data_buffer(self.weight_dev, weight_bytes)
         self.logits_buf = self.acl.create_data_buffer(self.logits_dev, logits_bytes)
 
-        self.attr = self.acl.op.create_attr()
-        self._check(self.acl.op.set_attr_bool(self.attr, "transpose_x1", False), "set transpose_x1")
-        self._check(self.acl.op.set_attr_bool(self.attr, "transpose_x2", True), "set transpose_x2")
+        self.head_attr = self.acl.op.create_attr()
+        self._check(self.acl.op.set_attr_bool(self.head_attr, "transpose_x1", False), "set transpose_x1")
+        self._check(self.acl.op.set_attr_bool(self.head_attr, "transpose_x2", True), "set transpose_x2")
 
-    def run(self, hidden_state: np.ndarray) -> np.ndarray:
+        self.embed_attr = self.acl.op.create_attr()
+
+        indices_bytes = 1 * 4
+        embed_output_bytes = 1 * self.model_spec.hidden_size * 2
+
+        self.indices_dev, ret = self.acl.rt.malloc(indices_bytes, M)
+        if ret == 0:
+            self.embed_output_dev, ret = self.acl.rt.malloc(embed_output_bytes, M)
+        if ret == 0:
+            self.axis_dev, ret = self.acl.rt.malloc(indices_bytes, M)
+        if ret == 0:
+            self.indices_desc = self.acl.create_tensor_desc(1, [1], 3)
+            self.axis_desc = self.acl.create_tensor_desc(1, [1], 3)
+            self.embed_output_desc = self.acl.create_tensor_desc(1, [1, self.model_spec.hidden_size], 2)
+            self.indices_buf = self.acl.create_data_buffer(self.indices_dev, indices_bytes)
+            self.axis_buf = self.acl.create_data_buffer(self.axis_dev, indices_bytes)
+            self.embed_output_buf = self.acl.create_data_buffer(self.embed_output_dev, embed_output_bytes)
+            axis_host = np.array([0], dtype=np.int32)
+            self._check(
+                self.acl.rt.memcpy(self.axis_dev, indices_bytes, axis_host.ctypes.data, indices_bytes, H2D),
+                "acl.rt.memcpy(axis)",
+            )
+            self._embed_available = True
+
+    def embed(self, token_id: int) -> np.ndarray:
         if not self._weight_uploaded:
-            raise OmEngineError("ACL head executor not loaded")
+            raise OmEngineError("ACL tied weight ops not loaded")
+        if not self._embed_available:
+            raise OmEngineError("ACL GatherV2 op not available")
+        with self._lock:
+            self.runtime.bind_thread_context()
+            self.indices_host[0] = token_id
+            self._check(
+                self.acl.rt.memcpy(
+                    self.indices_dev, 4, self.indices_host.ctypes.data, 4, H2D,
+                ),
+                "acl.rt.memcpy(indices)",
+            )
+            ret = self.acl.op.execute(
+                "GatherV2",
+                [self.weight_desc, self.indices_desc, self.axis_desc],
+                [self.weight_buf, self.indices_buf, self.axis_buf],
+                [self.embed_output_desc],
+                [self.embed_output_buf],
+                self.embed_attr,
+                self.stream,
+            )
+            self._check(ret, "acl.op.execute(GatherV2)")
+            self._check(self.acl.rt.synchronize_stream(self.stream), "acl.rt.synchronize_stream")
+            embed_bytes = self.model_spec.hidden_size * 2
+            self._check(
+                self.acl.rt.memcpy(
+                    self.embed_output_host.ctypes.data, embed_bytes,
+                    self.embed_output_dev, embed_bytes, D2H,
+                ),
+                "acl.rt.memcpy(embed_output)",
+            )
+            return self.embed_output_host.reshape(1, 1, self.model_spec.hidden_size).copy()
+
+    def head(self, hidden_state: np.ndarray) -> np.ndarray:
+        if not self._weight_uploaded:
+            raise OmEngineError("ACL tied weight ops not loaded")
         with self._lock:
             self.runtime.bind_thread_context()
             hidden = np.asarray(hidden_state, dtype=np.float16).reshape(1, self.model_spec.hidden_size)
@@ -125,7 +199,7 @@ class _ACLHeadMatmulExecutor:
                 [self.hidden_buf, self.weight_buf],
                 [self.logits_desc],
                 [self.logits_buf],
-                self.attr,
+                self.head_attr,
                 self.stream,
             )
             self._check(ret, "acl.op.execute(MatMul)")
@@ -137,20 +211,23 @@ class _ACLHeadMatmulExecutor:
             return self.logits_host.reshape(1, 1, self.model_spec.vocab_size).copy()
 
     def close(self) -> None:
-        if self.attr is not None:
-            self.acl.op.destroy_attr(self.attr)
-        self.attr = None
-        for buf_name in ("hidden_buf", "weight_buf", "logits_buf"):
+        if self.head_attr is not None:
+            self.acl.op.destroy_attr(self.head_attr)
+        self.head_attr = None
+        if self.embed_attr is not None:
+            self.acl.op.destroy_attr(self.embed_attr)
+        self.embed_attr = None
+        for buf_name in ("hidden_buf", "weight_buf", "logits_buf", "indices_buf", "axis_buf", "embed_output_buf"):
             buf = getattr(self, buf_name)
             if buf is not None:
                 self.acl.destroy_data_buffer(buf)
                 setattr(self, buf_name, None)
-        for ptr_name in ("hidden_dev", "weight_dev", "logits_dev"):
+        for ptr_name in ("hidden_dev", "weight_dev", "logits_dev", "indices_dev", "axis_dev", "embed_output_dev"):
             ptr = getattr(self, ptr_name)
             if ptr is not None:
                 self.acl.rt.free(ptr)
                 setattr(self, ptr_name, None)
-        for desc_name in ("hidden_desc", "weight_desc", "logits_desc"):
+        for desc_name in ("hidden_desc", "weight_desc", "logits_desc", "indices_desc", "axis_desc", "embed_output_desc"):
             desc = getattr(self, desc_name)
             if desc is not None:
                 self.acl.destroy_tensor_desc(desc)
@@ -174,17 +251,16 @@ class _BoundEmbedHeadRuntime:
         self.config = config
         self.tied_weight: np.memmap | None = None
         self.final_norm_weight: np.memmap | None = None
-        self.head_executor: _ACLHeadMatmulExecutor | None = None
+        self.npu_ops: _ACLTiedWeightOps | None = None
 
     def load(self) -> None:
         if self.config is None:
             _, _, self.config = load_bound_embed_head_metadata(str(self.asset_dir))
         assert self.config is not None
-        if self.split_config.prefix_end != 0 or self.split_config.suffix_start != self.split_config.total_layers:
+        if self.split_config.prefix_end < 0 or self.split_config.suffix_start > self.split_config.total_layers:
             raise OmEngineError(
-                "bound_embed_head mode requires split 0/N/0 "
-                f"(got prefix_end={self.split_config.prefix_end}, "
-                f"suffix_start={self.split_config.suffix_start}, total={self.split_config.total_layers})"
+                f"invalid split for bound_embed_head: prefix_end={self.split_config.prefix_end}, "
+                f"suffix_start={self.split_config.suffix_start}, total={self.split_config.total_layers}"
             )
         if self.config.dtype != "float16":
             raise OmEngineError(f"unsupported bound asset dtype: {self.config.dtype}")
@@ -209,13 +285,13 @@ class _BoundEmbedHeadRuntime:
             shape=(self.model_spec.hidden_size,),
         )
 
-    def attach_head_executor(self, head_executor: _ACLHeadMatmulExecutor | None) -> None:
-        self.head_executor = head_executor
+    def attach_npu_ops(self, npu_ops: _ACLTiedWeightOps | None) -> None:
+        self.npu_ops = npu_ops
 
     def close(self) -> None:
-        if self.head_executor is not None:
-            self.head_executor.close()
-        self.head_executor = None
+        if self.npu_ops is not None:
+            self.npu_ops.close()
+        self.npu_ops = None
         self.tied_weight = None
         self.final_norm_weight = None
 
@@ -227,10 +303,12 @@ class _BoundEmbedHeadRuntime:
 
     def run_prefix(self, token_id: int, position: int) -> np.ndarray:
         del position
-        if self.tied_weight is None:
-            raise OmEngineError("bound embed/head assets not loaded")
         if token_id < 0 or token_id >= self.model_spec.vocab_size:
             raise OmEngineError(f"token_id out of range: {token_id}")
+        if self.npu_ops is not None:
+            return self.npu_ops.embed(token_id)
+        if self.tied_weight is None:
+            raise OmEngineError("bound embed/head assets not loaded")
         hidden = np.asarray(self.tied_weight[token_id], dtype=np.float16)
         return hidden.reshape(1, 1, self.model_spec.hidden_size)
 
@@ -240,8 +318,8 @@ class _BoundEmbedHeadRuntime:
             raise OmEngineError("bound embed/head assets not loaded")
         hidden = np.asarray(hidden_state, dtype=np.float16).reshape(1, self.model_spec.hidden_size)
         hidden = self._apply_final_norm(hidden)
-        if self.head_executor is not None:
-            return self.head_executor.run(hidden.ravel())
+        if self.npu_ops is not None:
+            return self.npu_ops.head(hidden.ravel())
         logits = hidden.astype(np.float16, copy=False) @ self.tied_weight.T
         return logits.astype(np.float16, copy=False).reshape(1, 1, self.model_spec.vocab_size)
 
@@ -457,7 +535,7 @@ class OmSplitEngine(SplitEngine):
         self.prefix: _ACLSplitSegment | None = None
         self.suffix: _ACLSplitSegment | None = None
         self.bound_runtime: _BoundEmbedHeadRuntime | None = None
-        self.bound_head_executor: _ACLHeadMatmulExecutor | None = None
+        self.bound_tied_ops: _ACLTiedWeightOps | None = None
         self._load_lock = threading.Lock()
         self._loaded = False
 
@@ -470,6 +548,9 @@ class OmSplitEngine(SplitEngine):
             self._load_impl()
             self._loaded = True
 
+    def is_loaded(self) -> bool:
+        return self._loaded
+
     def _load_impl(self) -> None:
         if self.mode == "bound_embed_head":
             if not self.bound_asset_dir:
@@ -481,13 +562,17 @@ class OmSplitEngine(SplitEngine):
                 config=self.bound_config,
             )
             self.bound_runtime.load()
+
+            needs_acl = bool(self.prefix_nl_dn or self.prefix_nl_ga or self.suffix_nl_dn or self.suffix_nl_ga)
             head_op_model_dir = Path(self.bound_asset_dir) / "op_models"
             head_om_files = list(head_op_model_dir.glob("*.om")) if head_op_model_dir.is_dir() else []
-            if head_om_files:
+            needs_acl = needs_acl or bool(head_om_files)
+
+            if needs_acl:
                 acl = _import_acl_module()
                 if acl is None:
                     raise OmEngineError(
-                        "bound_embed_head op_models are present but ACL Python bindings could not be imported. "
+                        "bound_embed_head requires ACL for segment OM or op_models. "
                         "Please start the controller from the Ascend environment "
                         "(for example by sourcing ascend-toolkit/set_env.sh or using the board run script)."
                     )
@@ -495,15 +580,34 @@ class OmSplitEngine(SplitEngine):
                 self.acl = acl
                 self.runtime = _ACLRuntime(acl)
                 self.runtime.init()
-                self.bound_head_executor = _ACLHeadMatmulExecutor(
-                    acl=acl,
+
+            if self.prefix_nl_dn or self.prefix_nl_ga:
+                assert self.runtime is not None and self.acl is not None
+                self.prefix = _ACLSplitSegment(
+                    self.acl, self.prefix_om, self.max_len,
+                    self.model_spec.hidden_size * 2, self.model_spec.hidden_size * 2, "hidden_states",
+                    self.model_spec, self.prefix_nl_dn, self.prefix_nl_ga,
+                )
+
+            if self.suffix_nl_dn or self.suffix_nl_ga:
+                assert self.runtime is not None and self.acl is not None
+                self.suffix = _ACLSplitSegment(
+                    self.acl, self.suffix_om, self.max_len,
+                    self.model_spec.hidden_size * 2, self.model_spec.hidden_size * 2, "hidden_states",
+                    self.model_spec, self.suffix_nl_dn, self.suffix_nl_ga,
+                )
+
+            if head_om_files:
+                assert self.runtime is not None and self.acl is not None
+                self.bound_tied_ops = _ACLTiedWeightOps(
+                    acl=self.acl,
                     runtime=self.runtime,
                     op_model_dir=str(head_op_model_dir),
                     model_spec=self.model_spec,
                 )
                 assert self.bound_runtime.tied_weight is not None
-                self.bound_head_executor.load(self.bound_runtime.tied_weight)
-                self.bound_runtime.attach_head_executor(self.bound_head_executor)
+                self.bound_tied_ops.load(self.bound_runtime.tied_weight)
+                self.bound_runtime.attach_npu_ops(self.bound_tied_ops)
             return
         if self.mode != "om_split":
             raise OmEngineError(f"unsupported om engine mode: {self.mode}")
@@ -534,7 +638,7 @@ class OmSplitEngine(SplitEngine):
         if self.bound_runtime is not None:
             self.bound_runtime.close()
         self.bound_runtime = None
-        self.bound_head_executor = None
+        self.bound_tied_ops = None
         if self.prefix is not None:
             self.prefix.close()
         if self.suffix is not None:
@@ -552,6 +656,14 @@ class OmSplitEngine(SplitEngine):
         if self.mode == "bound_embed_head":
             assert self.bound_runtime is not None
             self.bound_runtime.start_session()
+            if self.prefix is not None:
+                assert self.runtime is not None
+                self.runtime.bind_thread_context()
+                self.prefix.reset()
+            if self.suffix is not None:
+                assert self.runtime is not None
+                self.runtime.bind_thread_context()
+                self.suffix.reset()
             return
         if self.prefix is None or self.suffix is None:
             raise OmEngineError("engine not loaded")
@@ -569,7 +681,13 @@ class OmSplitEngine(SplitEngine):
         if self.mode == "bound_embed_head":
             if self.bound_runtime is None:
                 raise OmEngineError("bound embed/head runtime not loaded")
-            return self.bound_runtime.run_prefix(token_id, position)
+            hidden = self.bound_runtime.run_prefix(token_id, position)
+            if self.prefix is not None:
+                assert self.runtime is not None
+                self.runtime.bind_thread_context()
+                raw = self.prefix.execute(hidden.astype(np.float16, copy=False).tobytes(), position)
+                hidden = np.frombuffer(raw, dtype=np.float16).reshape(1, 1, self.model_spec.hidden_size)
+            return hidden
         if self.prefix is None:
             raise OmEngineError("engine not loaded")
         assert self.runtime is not None
@@ -581,7 +699,13 @@ class OmSplitEngine(SplitEngine):
         if self.mode == "bound_embed_head":
             if self.bound_runtime is None:
                 raise OmEngineError("bound embed/head runtime not loaded")
-            return self.bound_runtime.run_suffix(hidden_state, position)
+            hidden = hidden_state
+            if self.suffix is not None:
+                assert self.runtime is not None
+                self.runtime.bind_thread_context()
+                raw = self.suffix.execute(hidden.astype(np.float16, copy=False).tobytes(), position)
+                hidden = np.frombuffer(raw, dtype=np.float16).reshape(1, 1, self.model_spec.hidden_size)
+            return self.bound_runtime.run_suffix(hidden, position)
         if self.suffix is None:
             raise OmEngineError("engine not loaded")
         assert self.runtime is not None

@@ -70,6 +70,9 @@ class DummyModel(Qwen35Model):
     def close(self):
         return
 
+    def is_loaded(self) -> bool:
+        return True
+
     def create_session(self):
         return self.session
 

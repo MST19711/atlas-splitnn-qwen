@@ -15,14 +15,8 @@ from qwen35_model_spec import (
     ModelSpec,
     SplitConfig,
     export_bound_embed_head_metadata,
+    parse_split,
 )
-
-
-def parse_split(value: str) -> tuple[int, int]:
-    parts = value.split(",")
-    if len(parts) != 2:
-        raise argparse.ArgumentTypeError("split must be 'prefix_end,suffix_start', e.g. '0,24'")
-    return int(parts[0]), int(parts[1])
 
 
 def main() -> None:
@@ -30,18 +24,17 @@ def main() -> None:
     parser.add_argument("--model-path", default="model_dl/Qwen3.5-2B")
     parser.add_argument("--output-dir", default="om_out/qwen3.5_2b_bound_embed_head")
     parser.add_argument("--split", type=parse_split, default=(0, 24),
-                        help="bound mode requires 0/N/0, e.g. 0,24 for 2B")
+                        help="split in 'prefix_end,suffix_start' format")
     parser.add_argument("--compile-op", action="store_true",
-                        help="compile ACL single-op MatMul via ATC container")
+                        help="compile ACL single-op GatherV2+MatMul via ATC container")
     args = parser.parse_args()
 
     model_spec = ModelSpec.from_pretrained(args.model_path)
     split_config = SplitConfig(args.split[0], args.split[1], model_spec.num_hidden_layers)
-    if split_config.prefix_end != 0 or split_config.suffix_start != model_spec.num_hidden_layers:
+    if split_config.prefix_end < 0 or split_config.suffix_start > model_spec.num_hidden_layers:
         raise ValueError(
-            "bound embed/head export requires split 0/N/0 "
-            f"(got prefix_end={split_config.prefix_end}, suffix_start={split_config.suffix_start}, "
-            f"total_layers={model_spec.num_hidden_layers})"
+            f"invalid split: prefix_end={split_config.prefix_end}, "
+            f"suffix_start={split_config.suffix_start}, total_layers={model_spec.num_hidden_layers}"
         )
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -70,6 +63,20 @@ def main() -> None:
     op_dir = out_dir / "op_models"
     op_dir.mkdir(parents=True, exist_ok=True)
     acl_op = [
+        {
+            "op": "GatherV2",
+            "input_desc": [
+                {"format": "ND", "type": "float16", "shape": [model_spec.vocab_size, model_spec.hidden_size]},
+                {"format": "ND", "type": "int32", "shape": [1]},
+                {"format": "ND", "type": "int32", "shape": [1]},
+            ],
+            "output_desc": [
+                {"format": "ND", "type": "float16", "shape": [1, model_spec.hidden_size]},
+            ],
+            "attr": [
+                {"name": "axis", "type": "int", "value": 0},
+            ],
+        },
         {
             "op": "MatMul",
             "input_desc": [

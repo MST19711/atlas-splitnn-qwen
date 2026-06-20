@@ -41,6 +41,9 @@ class FakeModel(Qwen35Model):
     def close(self):
         self.closed = True
 
+    def is_loaded(self) -> bool:
+        return self.loaded
+
     def create_session(self):
         return FakeSession()
 
@@ -111,9 +114,10 @@ class OpenAIControllerTests(unittest.TestCase):
             app = openai_controller.build_app(_make_args())
             route = self._route(app, "/v1/chat/completions")
             model = FakeModel()
+            tokenizer = FakeTokenizer()
             openai_controller.MODEL = model
-            openai_controller.TOKENIZER = FakeTokenizer()
-            openai_controller.RUNNER = openai_controller.OpenAIChatAdapter(model, openai_controller.TOKENIZER)
+            openai_controller.TOKENIZER = tokenizer
+            app.state.runner = openai_controller.OpenAIChatAdapter(model, tokenizer)
             app.state.model_loaded = False
             app.state.model_load_error = None
 
@@ -142,9 +146,10 @@ class OpenAIControllerTests(unittest.TestCase):
             app = openai_controller.build_app(_make_args())
             route = self._route(app, "/v1/chat/completions")
             model = FakeModel()
+            tokenizer = FakeTokenizer()
             openai_controller.MODEL = model
-            openai_controller.TOKENIZER = FakeTokenizer()
-            openai_controller.RUNNER = openai_controller.OpenAIChatAdapter(model, openai_controller.TOKENIZER)
+            openai_controller.TOKENIZER = tokenizer
+            app.state.runner = openai_controller.OpenAIChatAdapter(model, tokenizer)
             app.state.model_loaded = False
             app.state.model_load_error = None
 

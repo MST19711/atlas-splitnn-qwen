@@ -9,22 +9,14 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM
 
+from qwen35_model_spec import ModelSpec, SplitConfig, parse_split
 from qwen35_split_common import (
-    ModelSpec,
-    SplitConfig,
     SuffixWrapper,
     apply_qwen35_patches,
     build_segment_io_names,
     configure_eager_attention,
     export_metadata,
 )
-
-
-def parse_split(value: str) -> tuple[int, int]:
-    parts = value.split(",")
-    if len(parts) != 2:
-        raise argparse.ArgumentTypeError("split must be 'prefix_end,suffix_start', e.g. '4,20'")
-    return int(parts[0]), int(parts[1])
 
 
 def main():

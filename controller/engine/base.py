@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 
 import numpy as np
 
@@ -21,6 +20,9 @@ class SplitEngine(ABC):
     def close(self) -> None: ...
 
     @abstractmethod
+    def is_loaded(self) -> bool: ...
+
+    @abstractmethod
     def start_session(self) -> None: ...
 
     @abstractmethod
@@ -33,8 +35,4 @@ class SplitEngine(ABC):
     def run_suffix(self, hidden_state: np.ndarray, position: int) -> np.ndarray: ...
 
 
-@dataclass
-class EngineInfo:
-    engine_type: str
-    model_id: str
-    max_len: int
+

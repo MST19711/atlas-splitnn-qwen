@@ -10,7 +10,7 @@ import torch
 from transformers import AutoModelForCausalLM
 
 from export_qwen35_kvcache import Qwen35KVCacheWrapper
-from qwen35_model_spec import ModelSpec, SplitConfig
+from qwen35_model_spec import ModelSpec, SplitConfig, parse_split
 from qwen35_split_common import (
     MiddleWrapper,
     PrefixWrapper,
@@ -18,13 +18,6 @@ from qwen35_split_common import (
     apply_qwen35_patches,
     configure_eager_attention,
 )
-
-
-def parse_split(value: str) -> tuple[int, int]:
-    parts = value.split(",")
-    if len(parts) != 2:
-        raise argparse.ArgumentTypeError("split must be 'prefix_end,suffix_start'")
-    return int(parts[0]), int(parts[1])
 
 
 def make_cache(model_spec: ModelSpec, nl_dn: int, nl_ga: int, max_len: int,
