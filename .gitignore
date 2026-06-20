@@ -31,3 +31,4 @@ model_dl/
 tmp*/
 tmp*
 cmd.txtop_models_config/
+.pytest_cache/
