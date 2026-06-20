@@ -19,7 +19,7 @@
 ```bash
 # 0.8B
 pixi run hf download Qwen/Qwen3.5-0.8B \
-  --local-dir model_dl/Qwen3.5-0.8B
+  --local-dir model/Qwen3.5-0.8B
 
 # 2B
 pixi run hf download Qwen/Qwen3.5-2B \
@@ -33,6 +33,7 @@ pixi run hf download Qwen/Qwen3.5-4B \
 下载后确认目录存在 `config.json`：
 
 ```bash
+ls model/Qwen3.5-0.8B/config.json
 ls model_dl/Qwen3.5-4B/config.json
 ```
 
@@ -59,9 +60,9 @@ pixi run python scripts/export_qwen35_kvcache.py \
 ### 2. ATC 编译
 
 ```bash
+export INPUT_SHAPE="$(pixi run python scripts/gen_input_shape.py om_out/qwen3.5_kvcache_max256.onnx)"
 MODEL_ONNX=om_out/qwen3.5_kvcache_max256.onnx \
-INPUT_SHAPE="$(pixi run python scripts/gen_input_shape.py om_out/qwen3.5_kvcache_max256.onnx)" \
-bash scripts/podman_convert.sh
+  bash scripts/podman_convert.sh
 ```
 
 ### 3. 上传文件到板端
@@ -181,7 +182,7 @@ bash run_openai_split_controller_om_16k.sh
 ```bash
 pixi run python scripts/export_qwen35_bound_embed_head.py \
   --model-path model_dl/Qwen3.5-2B \
-  --output-dir qwen3.5_2b_bound_embed_head \
+  --output-dir om_out/qwen3.5_2b_bound_embed_head \
   --split 0,24 --compile-op
 ```
 
@@ -228,6 +229,23 @@ Qwen3.5-4B 在 `0/32/0` 切分下，板端只负责 embedding 与 lm_head，中�
 - embedding: CPU（直接从 `tied_weight.bin` 取词向量）
 - lm_head: NPU ACL `MatMul`
 - split: `0,32`
+
+主机侧中段服务：
+
+```bash
+pixi run python server/qwen35_split_service.py \
+  --host 0.0.0.0 --port 18080 \
+  --model-path model_dl/Qwen3.5-4B \
+  --device cuda:0 --max-len 16384 --split 0,32
+```
+
+SSH 反向隧道：
+
+```bash
+sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no \
+  -o ExitOnForwardFailure=yes \
+  -N -R 28080:127.0.0.1:18080 root@192.168.137.100
+```
 
 板端启动：
 

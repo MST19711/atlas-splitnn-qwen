@@ -74,6 +74,10 @@ pixi run hf auth login
 建议使用 `--local-dir` 直接下载到项目约定路径，避免后续导出脚本找不到 `config.json`。
 
 ```bash
+# Qwen3.5-0.8B
+pixi run hf download Qwen/Qwen3.5-0.8B \
+  --local-dir model/Qwen3.5-0.8B
+
 # Qwen3.5-2B
 pixi run hf download Qwen/Qwen3.5-2B \
   --local-dir model_dl/Qwen3.5-2B
@@ -100,6 +104,10 @@ find model_dl/Qwen3.5-4B -maxdepth 1 -type f | sort
 - `merges.txt`
 
 如果实际下载到别的目录名，后续脚本的 `--model-path` 也必须同步改成真实路径。
+
+说明：
+- `Qwen3.5-0.8B` 相关脚本默认从 `model/Qwen3.5-0.8B` 读取
+- `Qwen3.5-2B` / `Qwen3.5-4B` 相关脚本默认从 `model_dl/` 读取
 
 ---
 
@@ -169,7 +177,7 @@ pixi run python scripts/export_qwen35_split_suffix.py \
 ```bash
 pixi run python scripts/export_qwen35_bound_embed_head.py \
   --model-path model_dl/Qwen3.5-2B \
-  --output-dir qwen3.5_2b_bound_embed_head \
+  --output-dir om_out/qwen3.5_2b_bound_embed_head \
   --split 0,24 --compile-op
 ```
 
