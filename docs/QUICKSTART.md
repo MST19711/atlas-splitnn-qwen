@@ -12,6 +12,30 @@
 - Podman (ATC 编译容器)
 - CUDA GPU (SplitNN 方案需要)
 
+### 模型下载
+
+项目默认不包含模型权重。若要运行模型，先用 pixi 环境里的 `hfcli` 下载到约定目录：
+
+```bash
+# 0.8B
+pixi run hf download Qwen/Qwen3.5-0.8B \
+  --local-dir model_dl/Qwen3.5-0.8B
+
+# 2B
+pixi run hf download Qwen/Qwen3.5-2B \
+  --local-dir model_dl/Qwen3.5-2B
+
+# 4B
+pixi run hf download Qwen/Qwen3.5-4B \
+  --local-dir model_dl/Qwen3.5-4B
+```
+
+下载后确认目录存在 `config.json`：
+
+```bash
+ls model_dl/Qwen3.5-4B/config.json
+```
+
 ### 板端 (Atlas 200I DK A2)
 
 - SSH 可访问 (`root@192.168.137.100`, 密码 `Mind@123`)
@@ -195,6 +219,28 @@ python3 controller/openai_controller.py \
   --suffix-om /root/slm_deploy/qwen3.5_2b_suffix_ga_8k.om \
   --checksum
 ```
+
+## Qwen3.5-4B 参数绑定部署（推荐 0/32/0）
+
+Qwen3.5-4B 在 `0/32/0` 切分下，板端只负责 embedding 与 lm_head，中段 32 层全部在 CUDA 主机执行。
+
+当前推荐配置：
+- embedding: CPU（直接从 `tied_weight.bin` 取词向量）
+- lm_head: NPU ACL `MatMul`
+- split: `0,32`
+
+板端启动：
+
+```bash
+cd /root/slm_deploy
+bash run_openai_split_controller_bound_4b.sh
+```
+
+说明：
+- 中段服务健康检查路径是 `GET /v1/health`，不是 `/healthz`
+- 4B 上 `GatherV2` 词嵌入单算子可能失败，当前默认已改为 CPU embedding
+- 实测 `CPU embedding + NPU lm_head` 约 `4.5~4.7 tok/s`
+- `600 token` 长输出测试未观察到异常发散
 
 ---
 

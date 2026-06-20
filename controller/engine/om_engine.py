@@ -252,6 +252,8 @@ class _BoundEmbedHeadRuntime:
         self.tied_weight: np.memmap | None = None
         self.final_norm_weight: np.memmap | None = None
         self.npu_ops: _ACLTiedWeightOps | None = None
+        self._use_npu_embed = False
+        self._use_npu_head = False
 
     def load(self) -> None:
         if self.config is None:
@@ -287,11 +289,18 @@ class _BoundEmbedHeadRuntime:
 
     def attach_npu_ops(self, npu_ops: _ACLTiedWeightOps | None) -> None:
         self.npu_ops = npu_ops
+        # Embedding lookup is effectively a one-hot gather and is cheap on CPU.
+        # Keep lm_head MatMul on NPU when available, but default embedding to CPU
+        # to avoid GatherV2 compatibility issues on larger tied-weight tables.
+        self._use_npu_embed = False
+        self._use_npu_head = npu_ops is not None
 
     def close(self) -> None:
         if self.npu_ops is not None:
             self.npu_ops.close()
         self.npu_ops = None
+        self._use_npu_embed = False
+        self._use_npu_head = False
         self.tied_weight = None
         self.final_norm_weight = None
 
@@ -305,8 +314,15 @@ class _BoundEmbedHeadRuntime:
         del position
         if token_id < 0 or token_id >= self.model_spec.vocab_size:
             raise OmEngineError(f"token_id out of range: {token_id}")
-        if self.npu_ops is not None:
-            return self.npu_ops.embed(token_id)
+        if self.npu_ops is not None and self._use_npu_embed:
+            try:
+                return self.npu_ops.embed(token_id)
+            except OmEngineError as exc:
+                print(
+                    f"WARN: ACL GatherV2 unavailable, falling back to CPU embedding lookup: {exc}",
+                    flush=True,
+                )
+                self._use_npu_embed = False
         if self.tied_weight is None:
             raise OmEngineError("bound embed/head assets not loaded")
         hidden = np.asarray(self.tied_weight[token_id], dtype=np.float16)
@@ -318,8 +334,15 @@ class _BoundEmbedHeadRuntime:
             raise OmEngineError("bound embed/head assets not loaded")
         hidden = np.asarray(hidden_state, dtype=np.float16).reshape(1, self.model_spec.hidden_size)
         hidden = self._apply_final_norm(hidden)
-        if self.npu_ops is not None:
-            return self.npu_ops.head(hidden.ravel())
+        if self.npu_ops is not None and self._use_npu_head:
+            try:
+                return self.npu_ops.head(hidden.ravel())
+            except OmEngineError as exc:
+                print(
+                    f"WARN: ACL MatMul unavailable, falling back to CPU lm_head: {exc}",
+                    flush=True,
+                )
+                self._use_npu_head = False
         logits = hidden.astype(np.float16, copy=False) @ self.tied_weight.T
         return logits.astype(np.float16, copy=False).reshape(1, 1, self.model_spec.vocab_size)
 

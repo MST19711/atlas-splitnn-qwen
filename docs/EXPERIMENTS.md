@@ -100,3 +100,6 @@ Qwen3.5 引入 DeltaNet（线性注意力）+ Full Attention 混合架构。
 - 修复 SplitNN 中 RMSNorm 的 `output.type_as(x)` ONNX 兼容性（`to(x.dtype)` 替换 `type_as`）
 - Thinking 模式解禁（`enable_thinking` 参数正式支持）
 - Qwen3.5-4B SplitNN 1/30/1 切分验证通过（Prefix+Suffix ~2.8GB OM, 16K 上下文, ~1.1 tok/s）
+- 后续补充验证：Qwen3.5-4B 参数绑定 `0/32/0` 方案中，板端 `ACL GatherV2` 词嵌入在大 `tied_weight` 下可能失败（`ret=100024`）
+- 调整为 `CPU embedding + NPU lm_head` 后，链路恢复稳定，实测约 `4.5~4.7 tok/s`
+- `600 token` 长输出测试完成，未观察到异常发散

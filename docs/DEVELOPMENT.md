@@ -51,6 +51,58 @@ pydantic = ">=2.11.7"
 
 ---
 
+## 使用 hfcli 下载模型
+
+项目中的大模型权重默认不入库，需单独下载到本地。
+
+### CLI 检查
+
+本项目的 pixi 环境已包含 Hugging Face CLI，可直接使用：
+
+```bash
+pixi run hf --help
+```
+
+若需要登录私有仓库或规避限流，可先登录：
+
+```bash
+pixi run hf auth login
+```
+
+### 下载到约定目录
+
+建议使用 `--local-dir` 直接下载到项目约定路径，避免后续导出脚本找不到 `config.json`。
+
+```bash
+# Qwen3.5-2B
+pixi run hf download Qwen/Qwen3.5-2B \
+  --local-dir model_dl/Qwen3.5-2B
+
+# Qwen3.5-4B
+pixi run hf download Qwen/Qwen3.5-4B \
+  --local-dir model_dl/Qwen3.5-4B
+```
+
+下载完成后，可用下面的命令确认关键文件是否齐全：
+
+```bash
+find model_dl/Qwen3.5-4B -maxdepth 1 -type f | sort
+```
+
+至少应包含：
+- `config.json`
+- `tokenizer.json`
+- `tokenizer_config.json`
+- `model.safetensors.index.json`
+- `model.safetensors-*.safetensors`
+- `chat_template.jinja`
+- `vocab.json`
+- `merges.txt`
+
+如果实际下载到别的目录名，后续脚本的 `--model-path` 也必须同步改成真实路径。
+
+---
+
 ## ATC 转换
 
 ```bash
@@ -120,6 +172,24 @@ pixi run python scripts/export_qwen35_bound_embed_head.py \
   --output-dir qwen3.5_2b_bound_embed_head \
   --split 0,24 --compile-op
 ```
+
+4B 推荐使用 `0/32/0`：
+
+```bash
+pixi run python scripts/export_qwen35_bound_embed_head.py \
+  --model-path model_dl/Qwen3.5-4B \
+  --output-dir om_out/qwen3.5_4b_bound_embed_head \
+  --split 0,32 --compile-op
+```
+
+实现说明：
+- `0/32/0` 下板端不再运行 attention OM
+- 词嵌入默认走 CPU memmap lookup，不再默认使用 NPU `GatherV2`
+- lm_head 仍优先使用 ACL 单算子 `MatMul`
+
+实测（Atlas 200I DK A2 + CUDA 中段）：
+- `CPU embedding + NPU lm_head` 约 `4.5~4.7 tok/s`
+- `600 token` 长输出未观察到异常发散
 
 ---
 

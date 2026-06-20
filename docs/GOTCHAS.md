@@ -56,3 +56,5 @@
 18. **KV Cache OM 加载约 210 秒**: 1.9GB OM 从磁盘到 NPU 内存
 19. **prefill 阶段按 prompt 长度逐 token 执行**: 长 prompt 需数十秒
 20. `npu-smi info` 确认 Health: OK 后再启动推理
+21. **Qwen3.5-4B 参数绑定不建议用 NPU GatherV2 做 embedding**: `tied_weight.bin` 较大时板端可能出现 `acl.op.execute(GatherV2) failed, ret=100024`。推荐 `0/32/0` 下直接使用 CPU embedding lookup，仅保留 NPU `MatMul` 做 lm_head
+22. **中段服务健康检查路径是 `/v1/health`**: `server/qwen35_split_service.py` 不提供 `/healthz`
