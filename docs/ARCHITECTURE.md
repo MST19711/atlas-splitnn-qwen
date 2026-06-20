@@ -99,7 +99,7 @@ python3 controller/openai_controller.py \
 
 ## 引擎模式二：SplitNN OM (`splitnn_om`)
 
-将模型切分为三段，前后段在板端 NPU，中段在 CUDA 主机。
+将模型切分为三段，前后段在板端 NPU，中段在 CUDA 主机。前段/后段各自承担多少层、是否包含 embedding / lm_head、以及上下文窗口大小都由具体导出产物与启动参数决定；下图仅展示当前仓库中最常见的 `0.8B, split=4,20` 示例。
 
 ```
 ┌── 开发板 ──────────────────┐    ┌── CUDA 主机 ────────────────┐
@@ -115,22 +115,23 @@ python3 controller/openai_controller.py \
 └─────────────────────────────┘    └──────────────────────────────┘
 ```
 
-每步推理三个阶段：
+每步推理三个阶段（以 `split=4,20` 为例）：
 
 1. **Prefix**（板端 NPU）：Embedding → layers[0:4] → hidden state
 2. **Middle**（CUDA 主机）：HTTP 传输 hidden state → layers[4:20] → hidden state
 3. **Suffix**（板端 NPU）：layers[20:24] → LM Head → logits
 
-切分格式 `split-4-16-4` 表示前段 4 层 / 中段 16 层 / 后段 4 层。`--split 4,20` 表示 `prefix_end=4, suffix_start=20`。
+切分格式 `split-4-16-4` 表示前段 4 层 / 中段 16 层 / 后段 4 层。`--split 4,20` 表示 `prefix_end=4, suffix_start=20`。更一般地，`splitnn_om` 的板端执行范围由 `prefix_om` / `suffix_om` 的导出方式与 `--split` 共同决定，并非固定为“前4层+后4层”。
 
 ---
 
 ## 引擎模式三：SplitNN 参数绑定 (`splitnn_bound_embed_head`)
 
-板端利用 `tie_word_embeddings=True` 共享 `tied_weight.bin` 处理 Embedding + LM Head（避免 OM 中重复存储）。支持任意 split（如 `0/24/0` 或 `4/20`）：
+板端利用 `tie_word_embeddings=True` 共享 `tied_weight.bin` 处理 Embedding + LM Head（避免 OM 中重复存储）。支持任意 split（如 `0/24/0`、`4/20`、`0/32/0`）；板端究竟只做 embedding/head，还是再额外承担 prefix/suffix 注意力段，完全由切分方案与是否提供 attention OM 决定：
 
 - **split=0/24/0**: 板端仅 Embedding + LM Head，全部 Transformer 在主机
 - **split=4/20**: 板端 Embedding + 前4层注意力 + 后4层注意力 + LM Head，中段在主机
+- **split=0/32/0**: 4B 推荐组合，板端默认使用 CPU embedding + NPU `MatMul` head，中段承担全部 32 层
 
 ```
 ┌── 开发板 ──────────────────┐    ┌── CUDA 主机 ────────────────┐
@@ -214,12 +215,16 @@ SplitEngine (ABC)
 
 ## 模型对照
 
-| 模型 | 参数量 | hidden_size | 层数 | 上下文 | 方案 |
+| 模型 | 参数量 | hidden_size | 层数 | 已验证上下文 | 已验证方案 |
 |------|--------|-------------|------|--------|------|
 | Qwen3-0.6B | ~600M | 1024 | 28 (GQA) | 256 tok | KV Cache |
-| Qwen3.5-0.8B | ~800M | 1024 | 24 (18DN+6GA) | 256/4096 tok | KV Cache / SplitNN |
+| Qwen3.5-0.8B | ~800M | 1024 | 24 (18DN+6GA) | 256 / 4096 / 8K / 16K tok | KV Cache / SplitNN |
 | Qwen3.5-2B | ~2B | 2048 | 24 (18DN+6GA) | 8K tok | SplitNN 参数绑定 |
-| Qwen3.5-4B | ~4B | 2560 | 32 (24DN+8GA) | 16K tok | SplitNN OM |
+| Qwen3.5-4B | ~4B | 2560 | 32 (24DN+8GA) | 16K tok | SplitNN OM / SplitNN 参数绑定 |
+
+说明：
+- 这里列的是当前仓库中已有验证记录的组合
+- 引擎模式与模型大小不是一一绑定关系；是否可用主要取决于切分方案、板端资产形式与内存预算
 
 ---
 

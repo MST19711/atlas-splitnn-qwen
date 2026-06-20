@@ -8,11 +8,16 @@ Deploy Qwen small language models on the Huawei Ascend Atlas 200I DK A2 edge com
 
 ## Three Engine Modes
 
-| Mode | Model | Context | Board Execution | External Deps | Use Case |
+| Mode | Currently Validated Combos | Context (validated) | Board Execution (example) | External Deps | Use Case |
 |------|-------|---------|-----------------|---------------|----------|
-| **KV Cache Standalone** | 0.8B | 256/4096 tok | All 24 layers | None | Quick start, standalone |
-| **SplitNN OM** | 0.8B/4B | 16K tok | First 4 + last 4 layers | CUDA host + SSH | Large models, long context |
-| **SplitNN Param Binding** | 2B | 8K tok | Embedding + LM Head | CUDA host + SSH | Minimal board load |
+| **KV Cache Standalone** | 0.8B | 256/4096 tok | All Transformer layers | None | Quick start, standalone |
+| **SplitNN OM** | 0.8B / 4B | 8K / 16K tok | A configurable prefix/suffix subset + tokenizer/head | CUDA host + SSH | Large models, long context |
+| **SplitNN Param Binding** | 2B / 4B | 8K / 16K tok | Embedding / head plus optional prefix/suffix attention segments | CUDA host + SSH | Smaller board-side OM footprint, flexible partitioning |
+
+Notes:
+- The table lists combinations that are already validated in this repository; it does **not** mean model size, context window, or board-side execution range are hard-coded by engine mode
+- `splitnn_om` and `splitnn_bound_embed_head` are configurable in code with respect to split points, `max_len`, and how much work stays on the board
+- See [Design Decisions](./docs/DESIGN.md) and [Architecture](./docs/ARCHITECTURE.md) for the exact boundaries
 
 ---
 

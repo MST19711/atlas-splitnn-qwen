@@ -40,7 +40,7 @@
 └── run_openai_split_controller_om_16k.sh
 ```
 
-### SplitNN 参数绑定 (2B)
+### SplitNN 参数绑定（示例：2B）
 
 ```
 /root/slm_deploy/
@@ -67,13 +67,18 @@
 
 | 脚本 | 后端 | 说明 |
 |------|------|------|
-| `run_openai_kvcache_controller.sh` | `qwen35_kvcache_om` | 纯板端 KV Cache，256 tok（推荐入门） |
-| `run_openai_split_controller_om.sh` | `splitnn_om` | SplitNN OM，256 tok |
-| `run_openai_split_controller_om_16k.sh` | `splitnn_om` | SplitNN OM，16K tok |
-| `run_openai_split_controller_bound_2b.sh` | `splitnn_bound_embed_head` | 参数绑定，2B 模型 |
+| `run_openai_kvcache_controller.sh` | `qwen35_kvcache_om` | 纯板端 KV Cache，当前脚本示例为 256 tok |
+| `run_openai_split_controller_om.sh` | `splitnn_om` | SplitNN OM，当前脚本示例为较短上下文 |
+| `run_openai_split_controller_om_16k.sh` | `splitnn_om` | SplitNN OM，当前脚本示例为 16K |
+| `run_openai_split_controller_bound_2b.sh` | `splitnn_bound_embed_head` | 参数绑定，当前脚本示例为 2B `0/24/0` |
+| `run_openai_split_controller_bound_4b.sh` | `splitnn_bound_embed_head` | 参数绑定，当前脚本示例为 4B `0/32/0` |
 | `run_qwen3_kvcache.sh` | — | 裸 Qwen3 KV Cache 推理（调试用） |
 | `run_qwen35_splitnn.sh` | — | 裸 SplitNN 推理（调试用） |
 | `run_qwen35_splitnn_16k.sh` | — | 裸 SplitNN 16K 推理（调试用） |
+
+说明：
+- 上表描述的是仓库内现有脚本的默认参数，不表示上下文长度或板端执行范围被引擎模式固定写死
+- `splitnn_om` / `splitnn_bound_embed_head` 都可通过更换资产、`--split` 和 `--max-len` 调整板端承担的前后段范围与上下文窗口
 
 ---
 
@@ -96,17 +101,17 @@ sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no \
 
 ## 参数绑定编译
 
-参数绑定模式下板端 LM Head 使用 ACL single-op `MatMul` 执行，需要为真实 head shape 编译 OM：
+参数绑定模式下板端 LM Head 使用 ACL single-op `MatMul` 执行，需要为真实 head shape 编译 OM。以下命令只是当前验证过的示例：
 
 ```bash
 # 一键编译（需 ATC 容器）
 pixi run python scripts/export_qwen35_bound_embed_head.py \
   --model-path model_dl/Qwen3.5-2B \
-  --output-dir qwen3.5_2b_bound_embed_head \
+  --output-dir om_out/qwen3.5_2b_bound_embed_head \
   --split 0,24 --compile-op
 
 # 或单独编译已有资产
-bash scripts/compile_head_matmul.sh qwen3.5_2b_bound_embed_head
+bash scripts/compile_head_matmul.sh om_out/qwen3.5_2b_bound_embed_head
 ```
 
 ---

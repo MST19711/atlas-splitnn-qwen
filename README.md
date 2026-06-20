@@ -8,11 +8,16 @@
 
 ## 三种引擎模式
 
-| 方案 | 模型 | 上下文 | 板端执行 | 外部依赖 | 适用场景 |
+| 方案 | 当前已测试组合 | 上下文（已测试） | 板端执行（示例） | 外部依赖 | 适用场景 |
 |------|------|--------|----------|----------|----------|
-| **KV Cache 纯板端** | 0.8B | 256/4096 tok | 全部 24 层 | 无 | 入门、独立部署 |
-| **SplitNN OM** | 0.8B/4B | 16K tok | 前4层+后4层 | CUDA 主机 + SSH | 大模型、长上下文 |
-| **SplitNN 参数绑定** | 2B | 8K tok | Embedding+LM Head | CUDA 主机 + SSH | 极致降低板端负载 |
+| **KV Cache 纯板端** | 0.8B | 256/4096 tok | 全部 Transformer 层 | 无 | 入门、独立部署 |
+| **SplitNN OM** | 0.8B / 4B | 8K / 16K tok | 前后若干层 + tokenizer/head | CUDA 主机 + SSH | 大模型、长上下文 |
+| **SplitNN 参数绑定** | 2B / 4B | 8K / 16K tok | embedding / head + 可选前后注意力段 | CUDA 主机 + SSH | 降低板端 OM 体积、灵活切分 |
+
+说明：
+- 表中是当前仓库**已经验证通过**的典型组合，不表示模型大小、上下文窗口或板端执行范围被引擎模式写死
+- `splitnn_om` / `splitnn_bound_embed_head` 与切分点、`max_len`、板端承担的前后段范围在代码层面都是可配置的
+- 更详细的组合关系见 [设计决策](./docs/DESIGN.md) 与 [架构设计](./docs/ARCHITECTURE.md)
 
 ---
 

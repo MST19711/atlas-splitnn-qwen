@@ -144,10 +144,55 @@ pixi run python scripts/export_qwen35_split_suffix.py \
   --model-path model/Qwen3.5-0.8B --max-len 16384 --split 4,20 \
   --output om_out/qwen3.5_split_suffix_max16384.onnx
 
-# ATC 编译 (前缀 + 后缀各一次)
+# ATC 编译前缀
+export INPUT_SHAPE="$(pixi run python scripts/gen_input_shape.py om_out/qwen3.5_split_prefix_max16384.onnx)"
+MODEL_ONNX=om_out/qwen3.5_split_prefix_max16384.onnx \
+  bash scripts/podman_convert.sh
+
+# ATC 编译后缀
+export INPUT_SHAPE="$(pixi run python scripts/gen_input_shape.py om_out/qwen3.5_split_suffix_max16384.onnx)"
+MODEL_ONNX=om_out/qwen3.5_split_suffix_max16384.onnx \
+  bash scripts/podman_convert.sh
 ```
 
-### 2. 主机启动中段服务
+### 2. 上传文件到板端
+
+```bash
+# 控制器代码
+sshpass -p 'Mind@123' scp -r -o StrictHostKeyChecking=no \
+  controller/ root@192.168.137.100:/root/slm_deploy/
+
+# ModelSpec
+sshpass -p 'Mind@123' scp -o StrictHostKeyChecking=no \
+  scripts/qwen35_model_spec.py root@192.168.137.100:/root/slm_deploy/scripts/
+
+# Prefix / Suffix OM 与 metadata
+sshpass -p 'Mind@123' scp -o StrictHostKeyChecking=no \
+  om_out/qwen3.5_split_prefix_max16384.om \
+  om_out/qwen3.5_split_prefix_max16384.metadata.json \
+  om_out/qwen3.5_split_suffix_max16384.om \
+  om_out/qwen3.5_split_suffix_max16384.metadata.json \
+  root@192.168.137.100:/root/slm_deploy/
+
+# tokenizer 与配置
+sshpass -p 'Mind@123' scp -o StrictHostKeyChecking=no \
+  model/Qwen3.5-0.8B/config.json \
+  model/Qwen3.5-0.8B/tokenizer.json \
+  model/Qwen3.5-0.8B/tokenizer_config.json \
+  model/Qwen3.5-0.8B/vocab.json \
+  model/Qwen3.5-0.8B/merges.txt \
+  model/Qwen3.5-0.8B/chat_template.jinja \
+  root@192.168.137.100:/root/slm_deploy/
+
+# 启动脚本
+sshpass -p 'Mind@123' scp -o StrictHostKeyChecking=no \
+  board/run_openai_split_controller_om_16k.sh \
+  root@192.168.137.100:/root/slm_deploy/
+sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no root@192.168.137.100 \
+  'chmod +x /root/slm_deploy/run_openai_split_controller_om_16k.sh'
+```
+
+### 3. 主机启动中段服务
 
 ```bash
 pixi run python server/qwen35_split_service.py \
@@ -156,7 +201,7 @@ pixi run python server/qwen35_split_service.py \
   --device cuda:0 --max-len 16384 --split 4,20
 ```
 
-### 3. SSH 反向隧道
+### 4. SSH 反向隧道
 
 ```bash
 sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no \
@@ -164,7 +209,7 @@ sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no \
   -N -R 28080:127.0.0.1:18080 root@192.168.137.100
 ```
 
-### 4. 板端启动
+### 5. 板端启动
 
 ```bash
 cd /root/slm_deploy
@@ -186,7 +231,7 @@ pixi run python scripts/export_qwen35_bound_embed_head.py \
   --split 0,24 --compile-op
 ```
 
-### 2. (可选) 导出纯注意力 segment ONNX
+### 2. (可选) 导出并编译纯注意力 segment ONNX
 
 若板端需承担注意力层（如 split=4/20），需额外导出：
 
@@ -201,10 +246,44 @@ pixi run python scripts/export_qwen35_middle.py \
   --model-path model_dl/Qwen3.5-2B --max-len 8192 --split 4,20 \
   --segment suffix --output om_out/qwen3.5_2b_suffix_ga_8k.onnx
 
-# ATC 编译
+# ATC 编译 prefix attention OM
+export INPUT_SHAPE="$(pixi run python scripts/gen_input_shape.py om_out/qwen3.5_2b_prefix_dn_8k.onnx)"
+MODEL_ONNX=om_out/qwen3.5_2b_prefix_dn_8k.onnx \
+  bash scripts/podman_convert.sh
+
+# ATC 编译 suffix attention OM
+export INPUT_SHAPE="$(pixi run python scripts/gen_input_shape.py om_out/qwen3.5_2b_suffix_ga_8k.onnx)"
+MODEL_ONNX=om_out/qwen3.5_2b_suffix_ga_8k.onnx \
+  bash scripts/podman_convert.sh
 ```
 
-### 3. 板端启动（非 0/N/0 需传 OM 参数）
+### 3. 上传文件到板端
+
+```bash
+# 控制器代码
+sshpass -p 'Mind@123' scp -r -o StrictHostKeyChecking=no \
+  controller/ root@192.168.137.100:/root/slm_deploy/
+
+# ModelSpec
+sshpass -p 'Mind@123' scp -o StrictHostKeyChecking=no \
+  scripts/qwen35_model_spec.py root@192.168.137.100:/root/slm_deploy/scripts/
+
+# bound 资产
+sshpass -p 'Mind@123' scp -r -o StrictHostKeyChecking=no \
+  om_out/qwen3.5_2b_bound_embed_head root@192.168.137.100:/root/slm_deploy/
+
+# tokenizer 与配置
+sshpass -p 'Mind@123' scp -r -o StrictHostKeyChecking=no \
+  model_dl/Qwen3.5-2B root@192.168.137.100:/root/slm_deploy/model_2b
+
+# 若 split != 0/N/0，再上传 attention OM
+sshpass -p 'Mind@123' scp -o StrictHostKeyChecking=no \
+  om_out/qwen3.5_2b_prefix_dn_8k.om \
+  om_out/qwen3.5_2b_suffix_ga_8k.om \
+  root@192.168.137.100:/root/slm_deploy/
+```
+
+### 4. 板端启动（非 0/N/0 需传 OM 参数）
 
 ```bash
 cd /root/slm_deploy
@@ -230,7 +309,51 @@ Qwen3.5-4B 在 `0/32/0` 切分下，板端只负责 embedding 与 lm_head，中�
 - lm_head: NPU ACL `MatMul`
 - split: `0,32`
 
-主机侧中段服务：
+### 1. 导出并编译 bound 资产
+
+```bash
+pixi run python scripts/export_qwen35_bound_embed_head.py \
+  --model-path model_dl/Qwen3.5-4B \
+  --output-dir om_out/qwen3.5_4b_bound_embed_head \
+  --split 0,32 --compile-op
+```
+
+`0/32/0` 下板端不承担 attention 层，因此**不需要**额外导出或编译 prefix/suffix attention OM。
+
+### 2. 上传文件到板端
+
+```bash
+# 控制器代码
+sshpass -p 'Mind@123' scp -r -o StrictHostKeyChecking=no \
+  controller/ root@192.168.137.100:/root/slm_deploy/
+
+# ModelSpec
+sshpass -p 'Mind@123' scp -o StrictHostKeyChecking=no \
+  scripts/qwen35_model_spec.py root@192.168.137.100:/root/slm_deploy/scripts/
+
+# bound 资产
+sshpass -p 'Mind@123' scp -r -o StrictHostKeyChecking=no \
+  om_out/qwen3.5_4b_bound_embed_head root@192.168.137.100:/root/slm_deploy/
+
+# tokenizer 与配置
+sshpass -p 'Mind@123' scp -o StrictHostKeyChecking=no \
+  model_dl/Qwen3.5-4B/config.json \
+  model_dl/Qwen3.5-4B/tokenizer.json \
+  model_dl/Qwen3.5-4B/tokenizer_config.json \
+  model_dl/Qwen3.5-4B/vocab.json \
+  model_dl/Qwen3.5-4B/merges.txt \
+  model_dl/Qwen3.5-4B/chat_template.jinja \
+  root@192.168.137.100:/root/slm_deploy/model_4b/
+
+# 启动脚本
+sshpass -p 'Mind@123' scp -o StrictHostKeyChecking=no \
+  board/run_openai_split_controller_bound_4b.sh \
+  root@192.168.137.100:/root/slm_deploy/
+sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no root@192.168.137.100 \
+  'chmod +x /root/slm_deploy/run_openai_split_controller_bound_4b.sh'
+```
+
+### 3. 主机侧中段服务
 
 ```bash
 pixi run python server/qwen35_split_service.py \
@@ -239,7 +362,7 @@ pixi run python server/qwen35_split_service.py \
   --device cuda:0 --max-len 16384 --split 0,32
 ```
 
-SSH 反向隧道：
+### 4. SSH 反向隧道
 
 ```bash
 sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no \
@@ -247,7 +370,7 @@ sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no \
   -N -R 28080:127.0.0.1:18080 root@192.168.137.100
 ```
 
-板端启动：
+### 5. 板端启动
 
 ```bash
 cd /root/slm_deploy
