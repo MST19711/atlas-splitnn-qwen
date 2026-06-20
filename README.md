@@ -112,3 +112,5 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 详见 [快速开始](./docs/QUICKSTART.md)。
+
+OpenAI 请求参数、模型名查询、流式/非流式示例见 [快速开始](./docs/QUICKSTART.md) 中的“OpenAI 请求参数与示例”小节。

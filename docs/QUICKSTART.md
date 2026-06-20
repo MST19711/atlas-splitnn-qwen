@@ -127,6 +127,155 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ---
 
+## OpenAI 请求参数与示例
+
+所有后端统一暴露 OpenAI 兼容接口：
+
+- `GET /healthz`
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+
+### 1. 先查询可用模型名
+
+请求中的 `model` 字段必须与服务当前注册的模型名完全一致。最稳妥的做法是先查：
+
+```bash
+curl http://127.0.0.1:8000/v1/models
+```
+
+返回示例：
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "qwen3.5-0.8B-kvcache-om",
+      "object": "model",
+      "owned_by": "local"
+    }
+  ]
+}
+```
+
+常见默认模型名（以仓库内启动脚本为准）：
+
+- `run_openai_kvcache_controller.sh` → `qwen3.5-0.8B-kvcache-om`
+- `run_openai_split_controller_om.sh` → `qwen3.5-split-4-16-4-om`
+- `run_openai_split_controller_om_16k.sh` → `qwen3.5-split-4-16-4-om-16k`
+- `run_openai_split_controller_bound_2b.sh` → `qwen3.5-2b-split-0-24-0-om`
+- `run_openai_split_controller_bound_4b.sh` → `qwen3.5-4b-split-0-32-0-bound`
+
+若你手动启动控制器并修改了 `--model-name`，请求里也必须同步改成对应值。
+
+### 2. 请求体字段
+
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `model` | `string` | 是 | — | 从 `/v1/models` 返回的 `id` 中选择 |
+| `messages` | `array` | 是 | — | OpenAI 风格消息列表，常用 `system` / `user` / `assistant` |
+| `stream` | `bool` | 否 | `false` | 是否启用流式输出 |
+| `max_tokens` | `int` | 否 | `64` | 最多生成 token 数，当前接口限制 `1~4096` |
+| `temperature` | `float` | 否 | `thinking=false` 时为 `0.7`，`thinking=true` 时为 `1.0` | 采样温度 |
+| `top_k` | `int` | 否 | `thinking=false` 时为 `40`，`thinking=true` 时为 `20` | Top-K 采样 |
+| `top_p` | `float` | 否 | `thinking=false` 时为 `1.0`，`thinking=true` 时为 `0.95` | Top-P 采样 |
+| `presence_penalty` | `float` | 否 | `thinking=false` 时为 `0.0`，`thinking=true` 时为 `1.5` | 出现惩罚 |
+| `repetition_penalty` | `float` | 否 | `1.0` | 重复惩罚 |
+| `stop` | `string` 或 `string[]` | 否 | `null` | 停止字符串 |
+| `enable_thinking` | `bool` | 否 | `false` | 是否启用 thinking 模式 |
+
+常用消息格式：
+
+```json
+[
+  {"role": "system", "content": "你是一个简洁的助手。"},
+  {"role": "user", "content": "请介绍一下你自己。"}
+]
+```
+
+### 3. 非流式请求示例
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-0.8B-kvcache-om",
+    "messages": [
+      {"role": "system", "content": "你是一个简洁的中文助手。"},
+      {"role": "user", "content": "请用两句话介绍 Atlas 200I DK A2。"}
+    ],
+    "max_tokens": 128,
+    "stream": false
+  }'
+```
+
+### 4. 流式请求示例
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -N \
+  -d '{
+    "model": "qwen3.5-0.8B-kvcache-om",
+    "messages": [
+      {"role": "user", "content": "请逐步解释什么是 SplitNN。"}
+    ],
+    "max_tokens": 128,
+    "stream": true
+  }'
+```
+
+流式返回为标准 SSE，结束时会收到：
+
+```text
+data: [DONE]
+```
+
+### 5. 常用采样参数示例
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-0.8B-kvcache-om",
+    "messages": [
+      {"role": "user", "content": "写一段关于边缘部署的短文。"}
+    ],
+    "max_tokens": 256,
+    "temperature": 0.8,
+    "top_k": 32,
+    "top_p": 0.9,
+    "presence_penalty": 0.2,
+    "repetition_penalty": 1.05
+  }'
+```
+
+### 6. Thinking 模式示例
+
+`enable_thinking=true` 时，服务会自动切换到另一组默认采样参数，更适合推理型任务。
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-0.8B-kvcache-om",
+    "messages": [
+      {"role": "user", "content": "比较 SplitNN 与纯板端 KV Cache 的优缺点。"}
+    ],
+    "max_tokens": 256,
+    "enable_thinking": true
+  }'
+```
+
+### 7. 常见注意事项
+
+- 如果返回 `unsupported model`，先调用 `/v1/models`，不要手猜模型名
+- `max_tokens` 是生成长度，不是总上下文长度；总长度还受服务启动时的 `--max-len` 限制
+- 中段服务（SplitNN）健康检查是 `GET /v1/health`，OpenAI 控制器健康检查是 `GET /healthz`
+- 某些模型不建议打开 thinking，例如 Qwen3-0.6B
+
+---
+
 ## SplitNN OM 部署
 
 板端执行前/后段，CUDA 主机执行中段。
