@@ -6,10 +6,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from controller.cache.snapshot import CacheSnapshot
+from controller.engine.constants import M, H2D, D2H
 from controller.modeling.base import ModelInfo, Qwen35Model, Qwen35Session
 from scripts.qwen35_model_spec import ModelSpec
-
-from controller.engine.constants import M, H2D, D2H
 
 
 class Qwen35KvCacheError(RuntimeError):
@@ -46,6 +46,16 @@ class _KvLayout:
     kv_bytes: int
 
 
+def _device_to_host(acl, dev_ptr: int, size: int) -> np.ndarray:
+    host_buf = np.empty(size, np.uint8)
+    _check(acl.rt.memcpy(host_buf.ctypes.data, size, dev_ptr, size, D2H), "D2H")
+    return host_buf
+
+
+def _host_to_device(acl, dev_ptr: int, data: np.ndarray) -> None:
+    _check(acl.rt.memcpy(dev_ptr, data.nbytes, data.ctypes.data, data.nbytes, H2D), "H2D")
+
+
 class _ACLSessionRuntime:
     def __init__(self, model_path: str, model_spec: ModelSpec, max_len: int):
         self.model_path = model_path
@@ -67,6 +77,14 @@ class _ACLSessionRuntime:
         self._step = 0
         self._context = None
         self._lock = threading.Lock()
+        self._s_a: list[int] = []
+        self._c_a: list[int] = []
+        self._k_a: list[int] = []
+        self._v_a: list[int] = []
+        self._s_b: list[int] = []
+        self._c_b: list[int] = []
+        self._k_b: list[int] = []
+        self._v_b: list[int] = []
 
     @staticmethod
     def _build_layout(model_spec: ModelSpec, max_len: int) -> _KvLayout:
@@ -108,6 +126,8 @@ class _ACLSessionRuntime:
         self._dl = self._alloc_ptr(self.out_sz)
         s_a, c_a, k_a, v_a = self._alloc_cache_set()
         s_b, c_b, k_b, v_b = self._alloc_cache_set()
+        self._s_a, self._c_a, self._k_a, self._v_a = s_a, c_a, k_a, v_a
+        self._s_b, self._c_b, self._k_b, self._v_b = s_b, c_b, k_b, v_b
         self._datasets = [
             self._create_dataset_pair(s_a, c_a, k_a, v_a, s_b, c_b, k_b, v_b),
             self._create_dataset_pair(s_b, c_b, k_b, v_b, s_a, c_a, k_a, v_a),
@@ -175,6 +195,97 @@ class _ACLSessionRuntime:
             raise Qwen35KvCacheError("ACL runtime is not initialized")
         _check(self.acl.rt.set_context(self._context), "acl.rt.set_context")
 
+    def _active_cache_set(self):
+        if self._step % 2 == 1:
+            return self._s_b, self._c_b, self._k_b, self._v_b
+        return self._s_a, self._c_a, self._k_a, self._v_a
+
+    def snapshot_private(self, position: int) -> CacheSnapshot:
+        assert self.acl is not None
+        with self._lock:
+            self.bind_thread_context()
+            layout = self.layout
+            spec = self.model_spec
+
+            if self._step == 0:
+                def _zeros(nl, size):
+                    return [np.zeros(size, np.uint8) for _ in range(nl)]
+                s = _zeros(layout.nl_dn, layout.s_bytes)
+                c = _zeros(layout.nl_dn, layout.c_bytes)
+                k = _zeros(layout.nl_ga, layout.kv_bytes)
+                v = _zeros(layout.nl_ga, layout.kv_bytes)
+            else:
+                out_s, out_c, out_k, out_v = self._active_cache_set()
+                s = [_device_to_host(self.acl, ptr, layout.s_bytes) for ptr in out_s]
+                c = [_device_to_host(self.acl, ptr, layout.c_bytes) for ptr in out_c]
+                k = [_device_to_host(self.acl, ptr, layout.kv_bytes) for ptr in out_k]
+                v = [_device_to_host(self.acl, ptr, layout.kv_bytes) for ptr in out_v]
+
+            kvh = spec.num_key_value_heads
+            hdim = spec.head_dim
+            max_l = self.max_len
+
+            s_states = [
+                buf.view(np.float16).reshape(1, spec.linear_num_value_heads,
+                                             spec.linear_key_head_dim,
+                                             spec.linear_value_head_dim).copy()
+                for buf in s
+            ]
+            c_states = [
+                buf.view(np.float16).reshape(1, spec.conv_dim,
+                                             spec.linear_conv_kernel_dim - 1).copy()
+                for buf in c
+            ]
+            k_states = [
+                buf.view(np.float16).reshape(1, kvh, max_l, hdim).copy()
+                for buf in k
+            ]
+            v_states = [
+                buf.view(np.float16).reshape(1, kvh, max_l, hdim).copy()
+                for buf in v
+            ]
+            return CacheSnapshot(s_states=s_states, c_states=c_states,
+                                 k_states=k_states, v_states=v_states)
+
+    def restore_private(self, snap: CacheSnapshot, position: int) -> None:
+        assert self.acl is not None
+        with self._lock:
+            self.bind_thread_context()
+            layout = self.layout
+            spec = self.model_spec
+            kvh = spec.num_key_value_heads
+            hdim = spec.head_dim
+            max_l = self.max_len
+            tok_bytes = kvh * hdim * 2
+
+            def _h2d_list(dev_ptrs, host_list):
+                for dev_ptr, host_arr in zip(dev_ptrs, host_list):
+                    raw = host_arr.view(np.uint8).ravel()
+                    _host_to_device(self.acl, dev_ptr, raw)
+
+            s = [snap.s_states[i] for i in range(layout.nl_dn)]
+            c = [snap.c_states[i] for i in range(layout.nl_dn)]
+
+            k_fixed = []
+            v_fixed = []
+            for i in range(layout.nl_ga):
+                k_arr = snap.k_states[i].copy()
+                k_arr[0, :, position:, :] = 0
+                k_fixed.append(k_arr)
+                v_arr = snap.v_states[i].copy()
+                v_arr[0, :, position:, :] = 0
+                v_fixed.append(v_arr)
+
+            _h2d_list(self._s_a, s)
+            _h2d_list(self._c_a, c)
+            _h2d_list(self._k_a, k_fixed)
+            _h2d_list(self._v_a, v_fixed)
+
+            _h2d_list(self._s_b, s)
+            _h2d_list(self._c_b, c)
+            _h2d_list(self._k_b, k_fixed)
+            _h2d_list(self._v_b, v_fixed)
+
     def execute(self, token_id: int, position: int) -> np.ndarray:
         assert self.acl is not None and self._host_logits is not None
         with self._lock:
@@ -218,7 +329,7 @@ class Qwen35KvCacheSession(Qwen35Session):
         self.closed = False
         self.runtime.reset()
 
-    def prefill(self, input_ids: list[int]) -> np.ndarray:
+    def prefill(self, input_ids: list[int], position: int = 0) -> np.ndarray:
         if not input_ids:
             raise ValueError("empty input_ids")
         logits = None
@@ -236,6 +347,14 @@ class Qwen35KvCacheSession(Qwen35Session):
 
     def close(self) -> None:
         self.closed = True
+
+    def snapshot(self) -> CacheSnapshot:
+        return self.runtime.snapshot_private(self.position)
+
+    def restore(self, snap: CacheSnapshot, position: int) -> None:
+        self.runtime.restore_private(snap, position)
+        self.position = position
+        self.runtime.reset()
 
 
 class Qwen35KvCacheModel(Qwen35Model):
@@ -260,5 +379,5 @@ class Qwen35KvCacheModel(Qwen35Model):
     def is_loaded(self) -> bool:
         return self.runtime.acl is not None
 
-    def create_session(self) -> Qwen35Session:
+    def create_session(self, cache_entry=None) -> Qwen35Session:
         return Qwen35KvCacheSession(self.runtime)

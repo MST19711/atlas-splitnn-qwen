@@ -58,3 +58,15 @@
 20. `npu-smi info` 确认 Health: OK 后再启动推理
 21. **Qwen3.5-4B 参数绑定不建议用 NPU GatherV2 做 embedding**: `tied_weight.bin` 较大时板端可能出现 `acl.op.execute(GatherV2) failed, ret=100024`。推荐 `0/32/0` 下直接使用 CPU embedding lookup，仅保留 NPU `MatMul` 做 lm_head
 22. **中段服务健康检查路径是 `/v1/health`**: `server/qwen35_split_service.py` 不提供 `/healthz`
+
+---
+
+## Prefix Cache
+
+23. **Chat template 重新编码导致缓存 miss**：多轮对话时客户端发回的 assistant 回复文本被 `chat_template` 重新 tokenize，BPE 分词边界可能与原始生成 token 不一致。首次多轮请求缓存 miss 是预期行为（降级为 full rebuild），不影响生成正确性。相同 messages 重复请求第二个起命中。
+24. **DeltaNet S/C 不可截断**：递归状态矩阵无 position 维度，无法从完整叶节点截短服务于更短前缀。lookup 只在 `match_len == entry.position` 时返回 entry。
+25. **Snapshot 仅在请求边界执行**：D2H/H2D 48 个 cache 张量约 11MB，耗时 ~10-30ms。仅在 prefill 后和请求结束时触发，不影响 per-token 延迟。
+26. **K/V buffer 未填充区段必须清零**：restore 后 Full Attention K/V `[position..max_len-1]` 残留上请求的数据会污染 attention 计算，必须 H2D 零填充（DeltaNet S/C 无需清零，递归整体覆盖）。
+27. **Concurrent fork 开销**：同一 entry 被多请求并发 acquire 时触发 numpy deep copy（11MB, ~5ms），v1 串行生成流中罕见。
+28. **registry 不增 NPU 内存**：仅持 host numpy 副本，device buffer 复用现有 AB dataset。`--cache-max-entries` 控制 host 内存上限。
+29. **`--cache-disabled` 完全回退**：走现状每请求从头 prefill 路径，`X-Prefix-Cache-Status: disabled`。

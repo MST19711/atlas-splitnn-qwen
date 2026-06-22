@@ -31,10 +31,10 @@ class FakeRemote:
     def __init__(self):
         self.calls = []
 
-    def open(self, session_id):
+    def open(self, session_id, prefix_hash=None, resume_token_pos=None):
         self.calls.append(("open", session_id))
 
-    def close(self, session_id):
+    def close(self, session_id, evict=False):
         self.calls.append(("close", session_id))
 
     def step(self, session_id, hidden_state, position):

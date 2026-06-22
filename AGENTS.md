@@ -37,9 +37,34 @@ pixi run python scripts/validate_qwen35_kvcache_ort.py om_out/qwen3.5_kvcache_ma
 pixi run python -m pytest tests/ -v
 ```
 
+### Prefix Cache 验证
+```bash
+# 单元 + 集成测试
+pixi run python -m pytest tests/test_prefix_cache_*.py -v
+
+# 板端多轮对话验证（两轮 curl）
+# 启动服务：bash /root/slm_deploy/run_openai_kvcache_controller.sh
+# 第一轮：
+curl -i -X POST http://192.168.137.100:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.5-0.8B-kvcache-om","messages":[{"role":"user","content":"你好"}],"max_tokens":32}'
+# 第二轮（携带第一轮 reply）：
+curl -i -X POST http://192.168.137.100:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.5-0.8B-kvcache-om","messages":[{"role":"user","content":"你好"},{"role":"assistant","content":"...把第一轮回复放入..."},{"role":"user","content":"再说一遍"}],"max_tokens":32}'
+# 第二轮响应头应含有 X-Prefix-Cache-Status: hit
+
+# cache-disabled 回退
+cd /root/slm_deploy && bash run_openai_kvcache_controller.sh --cache-disabled
+
+# 可选 cache 参数
+# --cache-max-entries 8 --cache-ttl-sec 300 --cache-min-prefix-len 8
+```
+
 ### 板端部署
 ```bash
 cd /root/slm_deploy && bash run_openai_kvcache_controller.sh  # 纯板端 KV Cache (推荐)
+cd /root/slm_deploy && bash run_openai_kvcache_controller.sh --cache-disabled  # 关闭 prefix cache
 cd /root/slm_deploy && bash run_openai_split_controller_bound_2b.sh  # 参数绑定 2B
 ```
 

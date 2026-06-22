@@ -16,8 +16,8 @@ class FakeSession(Qwen35Session):
         self.position = 0
         self.closed = False
 
-    def prefill(self, input_ids):
-        self.position = len(input_ids)
+    def prefill(self, input_ids, position: int = 0):
+        self.position = position + len(input_ids)
         return _logits(1)
 
     def decode_next(self, token_id):
@@ -44,7 +44,7 @@ class FakeModel(Qwen35Model):
     def is_loaded(self) -> bool:
         return self.loaded
 
-    def create_session(self):
+    def create_session(self, cache_entry=None):
         return FakeSession()
 
 
