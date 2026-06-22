@@ -13,6 +13,7 @@ import zlib
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 from pathlib import Path
 from typing import Optional
 
@@ -154,6 +155,15 @@ class SplitService:
                 )
             print("[warn] CUDA unavailable, falling back to CPU for local simulation.", flush=True)
             requested_device = torch.device("cpu")
+        if requested_device.type == "mps" and not torch.backends.mps.is_available():
+            if not allow_cpu_fallback:
+                raise RuntimeError(
+                    "MPS unavailable in the current PyTorch environment. "
+                    f"torch={torch.__version__}, "
+                    f"torch.backends.mps.is_available()={torch.backends.mps.is_available()}."
+                )
+            print("[warn] MPS unavailable, falling back to CPU.", flush=True)
+            requested_device = torch.device("cpu")
         self.device = requested_device
         self.max_len = max_len
         self.session_timeout_sec = session_timeout_sec
@@ -197,8 +207,14 @@ class SplitService:
                     self._alias_index.pop(alias, None)
                 session.release()
                 released += 1
-        if released and self.device.type == "cuda":
-            torch.cuda.empty_cache()
+        if released:
+            try:
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                elif self.device.type == "mps":
+                    torch.mps.empty_cache()
+            except Exception:
+                pass
         return released
 
     def _load_model(self, model_path: str) -> None:
@@ -238,7 +254,7 @@ class SplitService:
             "protocol_version": PROTOCOL_VERSION,
             "model": self.model_name,
             "device": str(self.device),
-            "cuda_available": torch.cuda.is_available(),
+            "mps_available": torch.backends.mps.is_available() if hasattr(torch.backends, 'mps') else False,
             "simulation_mode": self.device.type != "cuda",
             "sessions": session_count,
             "max_sessions": self.max_sessions,
@@ -409,9 +425,11 @@ class SplitService:
                 session.last_access_at = time.time()
                 hidden_bytes = (hidden_out.detach().to("cpu").contiguous()
                                 .numpy().astype(np.float16).tobytes())
-            except torch.cuda.OutOfMemoryError as exc:
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+                if isinstance(exc, RuntimeError) and "MPS" not in str(exc) and "out of memory" not in str(exc).lower():
+                    raise
                 self._release_sessions([session_id])
-                raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "CUDA_OOM", str(exc)) from exc
+                raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "OOM", str(exc)) from exc
 
             latency_ms = (time.perf_counter() - start) * 1000.0
             response_headers = {
@@ -429,6 +447,11 @@ class SplitService:
 
 
 SERVICE: Optional[SplitService] = None
+
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -517,7 +540,7 @@ def main():
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--model-path", default="model/Qwen3.5-0.8B")
     parser.add_argument("--max-len", type=int, default=16384)
-    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--device", default="mps")
     parser.add_argument("--session-timeout-sec", type=int, default=300)
     parser.add_argument("--max-sessions", type=int, default=8)
     parser.add_argument("--split", type=parse_split, default=(4, 20),
@@ -539,7 +562,8 @@ def main():
         max_sessions=args.max_sessions,
         allow_cpu_fallback=args.allow_cpu_fallback,
     )
-    server = HTTPServer((args.host, args.port), Handler)
+    server = ThreadedHTTPServer((args.host, args.port), Handler)
+    server.socket.settimeout(10.0)
     print(f"Listening on http://{args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()

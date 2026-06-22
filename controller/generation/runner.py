@@ -160,6 +160,12 @@ class TokenGenerationRunner:
                         thinking_phase = False
                     else:
                         thinking_tokens += 1
+                    pending_output_ids.append(token_id)
+                    output_text, delta, _ = self._flush_pending_output(
+                        pending_output_ids, output_text, params.stop,
+                    )
+                    if delta:
+                        yield GenerationStep(delta_text=delta, finish_reason=None)
                 else:
                     if token_id == self.tokenizer.eos_token_id:
                         output_text, delta, hit_stop = self._flush_pending_output(

@@ -31,4 +31,5 @@ model_dl/
 tmp*/
 tmp*
 cmd.txtop_models_config/
-.pytest_cache/
+.pytest_cache/._*
+om_out.tar

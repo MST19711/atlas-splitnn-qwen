@@ -223,12 +223,13 @@ def build_app(args) -> FastAPI:
             return True
         return model.is_loaded()
 
-    def ensure_model_loaded() -> None:
+    async def ensure_model_loaded() -> None:
         if is_model_loaded():
             app.state.model_loaded = True
             return
+        import asyncio as _asyncio
         try:
-            model.load()
+            await _asyncio.to_thread(model.load)
         except Exception as exc:  # noqa: BLE001
             app.state.model_load_error = str(exc)
             raise
@@ -247,7 +248,8 @@ def build_app(args) -> FastAPI:
         }
         remote = getattr(model, "remote_middle", None)
         if remote is not None:
-            payload["remote"] = remote.health()
+            import asyncio as _asyncio
+            payload["remote"] = await _asyncio.to_thread(remote.health)
         if model.cache_registry is not None:
             payload["cache"] = model.cache_registry.stats()
         return payload
@@ -261,7 +263,7 @@ def build_app(args) -> FastAPI:
         if request.model != model.info.model_name:
             return error_response(400, f"unsupported model: {request.model}", "BAD_MODEL")
         try:
-            ensure_model_loaded()
+            await ensure_model_loaded()
             if request.stream:
                 async def stream_with_disconnect_watch():
                     cancel_event = threading.Event()
@@ -317,7 +319,9 @@ def build_app(args) -> FastAPI:
                 return StreamingResponse(stream_with_disconnect_watch(), media_type="text/event-stream")
 
             cancel_event = threading.Event()
-            response, cache_info = app.state.runner.run_non_stream(request, cancel_event)
+            response, cache_info = await asyncio.to_thread(
+                app.state.runner.run_non_stream, request, cancel_event,
+            )
             headers = _cache_response_headers(cache_info)
             return JSONResponse(content=response.model_dump(), headers=headers)
         except OmEngineError as exc:
@@ -358,7 +362,7 @@ def main():
     parser.add_argument("--suffix-om")
     parser.add_argument("--bound-asset-dir", default="")
     parser.add_argument("--connect-timeout", type=float, default=1.0)
-    parser.add_argument("--read-timeout", type=float, default=30.0)
+    parser.add_argument("--read-timeout", type=float, default=120.0)
     parser.add_argument("--checksum", action="store_true")
     parser.add_argument("--cache-disabled", action="store_true")
     parser.add_argument("--cache-max-entries", type=int, default=8)
