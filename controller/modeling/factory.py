@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from controller.cache.registry import PrefixCacheRegistry
 from controller.engine.om_engine import OmSplitEngine
 from controller.modeling.base import Qwen35Model
 from controller.modeling.kvcache_qwen35 import Qwen35KvCacheModel
@@ -29,8 +30,10 @@ class BackendConfig:
     suffix_om: str | None
     bound_asset_dir: str
     model_om: str
-
-
+    cache_disabled: bool = False
+    cache_max_entries: int = 8
+    cache_ttl_sec: int = 300
+    cache_min_prefix_len: int = 8
 
 
 def make_model_name(model_spec: ModelSpec, split: tuple[int, int], backend: str) -> str:
@@ -59,6 +62,18 @@ def _load_split_model_spec(config: BackendConfig):
     return model_spec, split_config, None
 
 
+def _make_cache_registry(config: BackendConfig, middle_client=None) -> PrefixCacheRegistry | None:
+    if config.cache_disabled:
+        return None
+    return PrefixCacheRegistry(
+        max_entries=config.cache_max_entries,
+        ttl_sec=config.cache_ttl_sec,
+        min_prefix_len=config.cache_min_prefix_len,
+        tag=config.backend,
+        middle_client=middle_client,
+    )
+
+
 def create_model(config: BackendConfig) -> Qwen35Model:
     if config.backend == "qwen35_kvcache_om":
         model_spec = ModelSpec.from_pretrained(config.model_path)
@@ -67,12 +82,14 @@ def create_model(config: BackendConfig) -> Qwen35Model:
             (0, model_spec.num_hidden_layers),
             config.backend,
         )
-        return Qwen35KvCacheModel(
+        model = Qwen35KvCacheModel(
             model_name=model_name,
             model_path=config.model_om,
             model_spec=model_spec,
             max_len=config.max_len,
         )
+        model.cache_registry = _make_cache_registry(config)
+        return model
 
     model_spec, split_config, bound_config = _load_split_model_spec(config)
     effective_split = (split_config.prefix_end, split_config.suffix_start)
@@ -116,7 +133,7 @@ def create_model(config: BackendConfig) -> Qwen35Model:
         read_timeout=config.read_timeout,
         checksum=config.checksum,
     )
-    return SplitNNQwen35Model(
+    model = SplitNNQwen35Model(
         model_name=model_name,
         max_len=config.max_len,
         vocab_size=model_spec.vocab_size,
@@ -124,3 +141,5 @@ def create_model(config: BackendConfig) -> Qwen35Model:
         engine=engine,
         remote_middle=remote,
     )
+    model.cache_registry = _make_cache_registry(config, middle_client=remote)
+    return model

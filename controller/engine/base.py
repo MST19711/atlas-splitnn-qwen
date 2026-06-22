@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from scripts.qwen35_model_spec import ModelSpec
+
+if TYPE_CHECKING:
+    from controller.cache.snapshot import CacheSnapshot
 
 
 class SplitEngine(ABC):
@@ -33,6 +37,13 @@ class SplitEngine(ABC):
 
     @abstractmethod
     def run_suffix(self, hidden_state: np.ndarray, position: int) -> np.ndarray: ...
+
+    def snapshot(self) -> tuple["CacheSnapshot | None", "CacheSnapshot | None"]:
+        raise NotImplementedError
+
+    def restore(self, prefix_snap: "CacheSnapshot | None",
+                suffix_snap: "CacheSnapshot | None", position: int) -> None:
+        raise NotImplementedError
 
 
 

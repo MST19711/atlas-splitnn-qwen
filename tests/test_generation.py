@@ -45,9 +45,9 @@ class DummySession(Qwen35Session):
         self.closed = False
         self.calls = []
 
-    def prefill(self, input_ids):
+    def prefill(self, input_ids, position: int = 0):
         self.calls.append(("prefill", list(input_ids)))
-        self.position = len(input_ids)
+        self.position = position + len(input_ids)
         return self.logits_list.pop(0)
 
     def decode_next(self, token_id: int):
@@ -57,6 +57,11 @@ class DummySession(Qwen35Session):
 
     def close(self):
         self.closed = True
+
+    def snapshot(self): ...
+
+    def restore(self, snap, position):
+        self.position = position
 
 
 class DummyModel(Qwen35Model):
@@ -73,7 +78,7 @@ class DummyModel(Qwen35Model):
     def is_loaded(self) -> bool:
         return True
 
-    def create_session(self):
+    def create_session(self, cache_entry=None):
         return self.session
 
 

@@ -7,7 +7,7 @@ import zlib
 
 import numpy as np
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
 class RemoteMiddleError(RuntimeError):
@@ -46,21 +46,27 @@ class RemoteMiddleClient:
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def open(self, session_id: str) -> dict:
-        return self._request_json(
-            "/v1/session/open",
-            {
-                "session_id": session_id,
-                "model": self.model_name,
-                "max_len": self.max_len,
-                "hidden_size": self.hidden_size,
-                "dtype": "fp16",
-                "protocol_version": PROTOCOL_VERSION,
-            },
-        )
+    def open(self, session_id: str, prefix_hash: str | None = None,
+             resume_token_pos: int | None = None) -> dict:
+        payload: dict = {
+            "session_id": session_id,
+            "model": self.model_name,
+            "max_len": self.max_len,
+            "hidden_size": self.hidden_size,
+            "dtype": "fp16",
+            "protocol_version": PROTOCOL_VERSION,
+        }
+        if prefix_hash is not None:
+            payload["prefix_hash"] = prefix_hash
+        if resume_token_pos is not None:
+            payload["resume_token_pos"] = resume_token_pos
+        return self._request_json("/v1/session/open", payload)
 
-    def close(self, session_id: str) -> dict:
-        return self._request_json("/v1/session/close", {"session_id": session_id})
+    def close(self, session_id: str, evict: bool = False) -> dict:
+        return self._request_json("/v1/session/close", {
+            "session_id": session_id,
+            "evict": evict,
+        })
 
     def step(self, session_id: str, hidden_state: np.ndarray, position: int) -> tuple[np.ndarray, float]:
         body = hidden_state.astype(np.float16, copy=False).reshape(1, 1, self.hidden_size).tobytes()

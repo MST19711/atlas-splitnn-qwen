@@ -79,26 +79,28 @@ class OpenAIChatAdapter:
         self,
         request: ChatCompletionRequest,
         cancel_event: threading.Event | None = None,
+        cache_info: dict | None = None,
     ):
         params = self.resolve_sampling_params(request)
         prompt_ids = self.build_prompt_ids(request)
-        yield from self.runner.generate(prompt_ids, params, cancel_event=cancel_event)
+        yield from self.runner.generate(prompt_ids, params, cancel_event=cancel_event, cache_info=cache_info)
 
     def run_non_stream(
         self,
         request: ChatCompletionRequest,
         cancel_event: threading.Event | None = None,
-    ) -> ChatCompletionResponse:
+    ) -> tuple[ChatCompletionResponse, dict]:
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         chunks = []
         finish_reason = "stop"
-        for step in self.generate_steps(request, cancel_event=cancel_event):
+        cache_info: dict = {}
+        for step in self.generate_steps(request, cancel_event=cancel_event, cache_info=cache_info):
             if step.delta_text:
                 chunks.append(step.delta_text)
             if step.finish_reason is not None:
                 finish_reason = step.finish_reason
-        return ChatCompletionResponse(
+        response = ChatCompletionResponse(
             id=request_id,
             object="chat.completion",
             created=created,
@@ -111,6 +113,7 @@ class OpenAIChatAdapter:
                 )
             ],
         )
+        return response, cache_info
 
     def run_stream(
         self,
@@ -119,6 +122,7 @@ class OpenAIChatAdapter:
     ):
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
+        cache_info: dict = {}
         first = ChatCompletionChunk(
             id=request_id,
             object="chat.completion.chunk",
@@ -127,7 +131,7 @@ class OpenAIChatAdapter:
             choices=[StreamChoice(index=0, delta=StreamDelta(role="assistant", content=""), finish_reason=None)],
         )
         yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
-        for step in self.generate_steps(request, cancel_event=cancel_event):
+        for step in self.generate_steps(request, cancel_event=cancel_event, cache_info=cache_info):
             if step.delta_text:
                 chunk = ChatCompletionChunk(
                     id=request_id,
@@ -147,6 +151,16 @@ class OpenAIChatAdapter:
                 )
                 yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
         yield "data: [DONE]\n\n"
+        yield cache_info
+
+
+def _cache_response_headers(cache_info: dict) -> dict[str, str]:
+    status = cache_info.get("cache_status", "disabled")
+    headers = {"X-Prefix-Cache-Status": status}
+    cache_len = cache_info.get("cache_len", 0)
+    if cache_len:
+        headers["X-Prefix-Cache-Len"] = str(cache_len)
+    return headers
 
 
 def build_app(args) -> FastAPI:
@@ -168,6 +182,10 @@ def build_app(args) -> FastAPI:
         suffix_om=args.suffix_om,
         bound_asset_dir=args.bound_asset_dir,
         model_om=args.model_om,
+        cache_disabled=getattr(args, "cache_disabled", False),
+        cache_max_entries=getattr(args, "cache_max_entries", 8),
+        cache_ttl_sec=getattr(args, "cache_ttl_sec", 300),
+        cache_min_prefix_len=getattr(args, "cache_min_prefix_len", 8),
     )
     model = create_model(config)
     tokenizer = Qwen35TokenizerAdapter(args.tokenizer_dir)
@@ -189,6 +207,8 @@ def build_app(args) -> FastAPI:
                 app.state.model_loaded = True
                 app.state.model_load_error = None
         yield
+        if model.cache_registry is not None:
+            model.cache_registry.stop()
         model.close()
         app.state.model_loaded = False
 
@@ -228,6 +248,8 @@ def build_app(args) -> FastAPI:
         remote = getattr(model, "remote_middle", None)
         if remote is not None:
             payload["remote"] = remote.health()
+        if model.cache_registry is not None:
+            payload["cache"] = model.cache_registry.stats()
         return payload
 
     @app.get("/v1/models")
@@ -268,6 +290,9 @@ def build_app(args) -> FastAPI:
                                 await asyncio.sleep(0.05)
                                 continue
                             if kind == "chunk":
+                                if isinstance(payload, dict):
+                                    # last item from run_stream is cache_info dict
+                                    continue
                                 yield payload
                                 continue
                             if kind == "cancelled":
@@ -292,8 +317,9 @@ def build_app(args) -> FastAPI:
                 return StreamingResponse(stream_with_disconnect_watch(), media_type="text/event-stream")
 
             cancel_event = threading.Event()
-            response = app.state.runner.run_non_stream(request, cancel_event)
-            return JSONResponse(content=response.model_dump())
+            response, cache_info = app.state.runner.run_non_stream(request, cancel_event)
+            headers = _cache_response_headers(cache_info)
+            return JSONResponse(content=response.model_dump(), headers=headers)
         except OmEngineError as exc:
             app.state.model_load_error = str(exc)
             return error_response(503, str(exc), "MODEL_LOAD_ERROR")
@@ -334,6 +360,10 @@ def main():
     parser.add_argument("--connect-timeout", type=float, default=1.0)
     parser.add_argument("--read-timeout", type=float, default=30.0)
     parser.add_argument("--checksum", action="store_true")
+    parser.add_argument("--cache-disabled", action="store_true")
+    parser.add_argument("--cache-max-entries", type=int, default=8)
+    parser.add_argument("--cache-ttl-sec", type=int, default=300)
+    parser.add_argument("--cache-min-prefix-len", type=int, default=8)
     args = parser.parse_args()
 
     import uvicorn

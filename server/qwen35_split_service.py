@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qwen3.5 SplitNN middle-segment HTTP service with CUDA execution."""
+# Qwen3.5 SplitNN middle-segment HTTP service with CUDA execution.
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from qwen35_split_common import (  # noqa: E402
     configure_eager_attention,
 )
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
 def parse_split(value: str) -> tuple[int, int]:
@@ -63,10 +63,13 @@ class SessionState:
     c_cache: list[torch.Tensor] = field(default_factory=list)
     k_cache: list[torch.Tensor] = field(default_factory=list)
     v_cache: list[torch.Tensor] = field(default_factory=list)
+    aliases: set[str] = field(default_factory=set)
+    ref_count: int = 0
 
     @classmethod
     def create(cls, session_id: str, max_len: int, device: torch.device,
-               model_spec: ModelSpec, nl_dn: int, nl_ga: int) -> "SessionState":
+               model_spec: ModelSpec, nl_dn: int, nl_ga: int,
+               aliases: set[str] | None = None) -> "SessionState":
         conv_ks = model_spec.linear_conv_kernel_dim
         return cls(
             session_id=session_id,
@@ -75,6 +78,7 @@ class SessionState:
             model_spec=model_spec,
             nl_dn=nl_dn,
             nl_ga=nl_ga,
+            aliases=aliases or set(),
             s_cache=[
                 torch.zeros((1, model_spec.linear_num_value_heads,
                                model_spec.linear_key_head_dim,
@@ -156,6 +160,7 @@ class SplitService:
         self.max_sessions = max_sessions
         self.allow_cpu_fallback = allow_cpu_fallback
         self.sessions: dict[str, SessionState] = {}
+        self._alias_index: dict[str, str] = {}
         self.sessions_lock = threading.Lock()
 
         self.model_spec = ModelSpec.from_pretrained(model_path)
@@ -188,6 +193,8 @@ class SplitService:
                 session = self.sessions.pop(session_id, None)
                 if session is None:
                     continue
+                for alias in session.aliases:
+                    self._alias_index.pop(alias, None)
                 session.release()
                 released += 1
         if released and self.device.type == "cuda":
@@ -218,7 +225,7 @@ class SplitService:
             expired = []
             with self.sessions_lock:
                 for session_id, session in self.sessions.items():
-                    if now - session.last_access_at > self.session_timeout_sec:
+                    if session.ref_count == 0 and now - session.last_access_at > self.session_timeout_sec:
                         expired.append(session_id)
             self._release_sessions(expired)
 
@@ -252,26 +259,63 @@ class SplitService:
                            f"hidden_size must be {self.hidden_size}")
         if str(payload.get("dtype")) != "fp16":
             raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_DTYPE", "dtype must be fp16")
-        if int(payload.get("protocol_version", -1)) != PROTOCOL_VERSION:
-            raise ApiError(
-                HTTPStatus.BAD_REQUEST,
-                "BAD_PROTOCOL_VERSION",
-                f"protocol_version must be {PROTOCOL_VERSION}",
-            )
+        pv = int(payload.get("protocol_version", PROTOCOL_VERSION))
+        if pv not in (1, 2):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_PROTOCOL_VERSION",
+                           f"protocol_version must be 1 or 2")
+
+        prefix_hash = str(payload.get("prefix_hash", "")).strip()
+        resume_pos = payload.get("resume_token_pos")
 
         with self.sessions_lock:
-            if len(self.sessions) >= self.max_sessions:
-                raise ApiError(
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                    "TOO_MANY_SESSIONS",
-                    f"active sessions exceed limit {self.max_sessions}",
-                )
+            if prefix_hash:
+                existing_id = self._alias_index.get(prefix_hash)
+                if existing_id is not None:
+                    session = self.sessions.get(existing_id)
+                    if session is not None:
+                        session.ref_count += 1
+                        session.last_access_at = time.time()
+                        if resume_pos is not None:
+                            session.position_next = int(resume_pos)
+                        return {
+                            "ok": True,
+                            "session_id": existing_id,
+                            "max_len": self.max_len,
+                            "hidden_size": self.hidden_size,
+                            "dtype": "fp16",
+                            "server_device": str(self.device),
+                            "session_resumed": True,
+                        }
+
             if session_id in self.sessions:
                 raise ApiError(HTTPStatus.CONFLICT, "SESSION_EXISTS", "session already exists")
-            self.sessions[session_id] = SessionState.create(
+            if len(self.sessions) >= self.max_sessions:
+                # Try to evict LRU with ref_count == 0
+                expired = []
+                for sid, s in self.sessions.items():
+                    if s.ref_count == 0:
+                        expired.append(sid)
+                if not expired:
+                    raise ApiError(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        "TOO_MANY_SESSIONS",
+                        f"active sessions exceed limit {self.max_sessions}",
+                    )
+                for sid in expired[:1]:
+                    self._release_sessions([sid])
+
+            aliases = {prefix_hash} if prefix_hash else set()
+            session = SessionState.create(
                 session_id, self.max_len, self.device,
                 self.model_spec, self.mid_nl_dn, self.mid_nl_ga,
+                aliases=aliases,
             )
+            if resume_pos is not None:
+                session.position_next = int(resume_pos)
+            session.ref_count = 1
+            self.sessions[session_id] = session
+            for alias in aliases:
+                self._alias_index[alias] = session_id
 
         return {
             "ok": True,
@@ -283,14 +327,25 @@ class SplitService:
             "server_model_segment": (
                 f"layers[{self.split_config.prefix_end}:{self.split_config.suffix_start}]"
             ),
+            "session_resumed": False,
         }
 
     def close_session(self, payload: dict) -> dict:
         session_id = str(payload.get("session_id", "")).strip()
         if not session_id:
             raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_SESSION_ID", "missing session_id")
-        released = self._release_sessions([session_id]) > 0
-        return {"ok": True, "session_id": session_id, "released": released}
+        evict = payload.get("evict", False)
+        with self.sessions_lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                return {"ok": True, "session_id": session_id, "released": False}
+            if session.ref_count > 0:
+                session.ref_count -= 1
+            session.last_access_at = time.time()
+            if evict:
+                released = self._release_sessions([session_id]) > 0
+                return {"ok": True, "session_id": session_id, "released": released}
+        return {"ok": True, "session_id": session_id, "released": False}
 
     def step_session(self, headers, body: bytes) -> tuple[bytes, dict]:
         session_id = headers.get("X-Session-Id", "").strip()
@@ -301,7 +356,8 @@ class SplitService:
         except ValueError as exc:
             raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_POSITION", "invalid X-Position") from exc
 
-        if headers.get("X-Protocol-Version") != str(PROTOCOL_VERSION):
+        pv = int(headers.get("X-Protocol-Version", str(PROTOCOL_VERSION)))
+        if pv not in (1, 2):
             raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_PROTOCOL_VERSION",
                            "unsupported protocol version")
         if headers.get("X-Hidden-Shape") != self.hidden_shape:
@@ -329,7 +385,9 @@ class SplitService:
             raise ApiError(HTTPStatus.NOT_FOUND, "SESSION_NOT_FOUND", "session not found")
 
         with session.lock:
-            if position != session.position_next:
+            if pv >= 2:
+                session.position_next = position
+            elif position != session.position_next:
                 raise ApiError(
                     HTTPStatus.CONFLICT,
                     "POSITION_MISMATCH",
@@ -363,6 +421,7 @@ class SplitService:
                 "X-DType": "fp16",
                 "X-Byte-Length": str(self.hidden_bytes),
                 "X-Server-Latency-Ms": f"{latency_ms:.3f}",
+                "X-Protocol-Version": str(PROTOCOL_VERSION),
             }
             if checksum:
                 response_headers["X-Checksum"] = f"{zlib.crc32(hidden_bytes) & 0xffffffff:08x}"
@@ -430,7 +489,7 @@ class Handler(BaseHTTPRequestHandler):
             self._dispatch()
         except ApiError as exc:
             self._send_json(exc.status, {"ok": False, "error_code": exc.error_code,
-                                         "message": exc.message})
+                                          "message": exc.message})
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
             self._send_json(
@@ -443,7 +502,7 @@ class Handler(BaseHTTPRequestHandler):
             self._dispatch()
         except ApiError as exc:
             self._send_json(exc.status, {"ok": False, "error_code": exc.error_code,
-                                         "message": exc.message})
+                                          "message": exc.message})
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
             self._send_json(
@@ -459,8 +518,8 @@ def main():
     parser.add_argument("--model-path", default="model/Qwen3.5-0.8B")
     parser.add_argument("--max-len", type=int, default=16384)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--session-timeout-sec", type=int, default=60)
-    parser.add_argument("--max-sessions", type=int, default=2)
+    parser.add_argument("--session-timeout-sec", type=int, default=300)
+    parser.add_argument("--max-sessions", type=int, default=8)
     parser.add_argument("--split", type=parse_split, default=(4, 20),
                         help="prefix_end,suffix_start  (e.g. 4,20 for 4/16/4)")
     parser.add_argument(

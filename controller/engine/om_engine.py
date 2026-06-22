@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from controller.engine.base import SplitEngine
+from controller.cache.snapshot import CacheSnapshot
 from scripts.qwen35_model_spec import (
     BoundEmbedHeadConfig,
     ModelSpec,
@@ -16,6 +17,14 @@ from scripts.qwen35_model_spec import (
 )
 
 from controller.engine.constants import M, H2D, D2H
+
+
+def _device_to_host(acl, dev_ptr: int, size: int) -> np.ndarray:
+    host_buf = np.empty(size, np.uint8)
+    ret = acl.rt.memcpy(host_buf.ctypes.data, size, dev_ptr, size, D2H)
+    if ret != 0:
+        raise OmEngineError(f"D2H failed, ret={ret}")
+    return host_buf
 
 
 class OmEngineError(RuntimeError):
@@ -537,6 +546,79 @@ class _ACLSplitSegment:
             self.acl.rt.free(ptr)
         self.acl.mdl.unload(self.mid)
 
+    def _active_cache_set(self):
+        if self._step % 2 == 1:
+            return self._sB, self._cB, self._kB, self._vB
+        return self._sA, self._cA, self._kA, self._vA
+
+    def snapshot_segment(self) -> CacheSnapshot:
+        if self._step == 0:
+            s = [np.zeros(self.s_bytes, np.uint8) for _ in range(self.nl_dn)]
+            c = [np.zeros(self.c_bytes, np.uint8) for _ in range(self.nl_dn)]
+            k = [np.zeros(self.kv_bytes, np.uint8) for _ in range(self.nl_ga)]
+            v = [np.zeros(self.kv_bytes, np.uint8) for _ in range(self.nl_ga)]
+        else:
+            out_s, out_c, out_k, out_v = self._active_cache_set()
+            s = [_device_to_host(self.acl, ptr, self.s_bytes) for ptr in out_s]
+            c = [_device_to_host(self.acl, ptr, self.c_bytes) for ptr in out_c]
+            k = [_device_to_host(self.acl, ptr, self.kv_bytes) for ptr in out_k]
+            v = [_device_to_host(self.acl, ptr, self.kv_bytes) for ptr in out_v]
+
+        spec = self.model_spec
+        kvh, hdim, max_l = spec.num_key_value_heads, spec.head_dim, self.max_len
+        s_states = [
+            buf.view(np.float16).reshape(1, spec.linear_num_value_heads,
+                                         spec.linear_key_head_dim,
+                                         spec.linear_value_head_dim).copy()
+            for buf in s
+        ]
+        c_states = [
+            buf.view(np.float16).reshape(1, spec.conv_dim,
+                                         spec.linear_conv_kernel_dim - 1).copy()
+            for buf in c
+        ]
+        k_states = [
+            buf.view(np.float16).reshape(1, kvh, max_l, hdim).copy()
+            for buf in k
+        ]
+        v_states = [
+            buf.view(np.float16).reshape(1, kvh, max_l, hdim).copy()
+            for buf in v
+        ]
+        return CacheSnapshot(s_states=s_states, c_states=c_states,
+                             k_states=k_states, v_states=v_states)
+
+    def restore_segment(self, snap: CacheSnapshot, position: int) -> None:
+        kvh, hdim, max_l = self.model_spec.num_key_value_heads, self.model_spec.head_dim, self.max_len
+
+        def _h2d(dev_ptrs, host_list):
+            for dev_ptr, host_arr in zip(dev_ptrs, host_list):
+                raw = host_arr.view(np.uint8).ravel()
+                self._check(self.acl.rt.memcpy(dev_ptr, raw.nbytes,
+                                               raw.ctypes.data, raw.nbytes, H2D),
+                            "restore H2D")
+
+        s = [snap.s_states[i] for i in range(self.nl_dn)]
+        c = [snap.c_states[i] for i in range(self.nl_dn)]
+        k_fixed, v_fixed = [], []
+        for i in range(self.nl_ga):
+            ka = snap.k_states[i].copy()
+            ka[0, :, position:, :] = 0
+            k_fixed.append(ka)
+            va = snap.v_states[i].copy()
+            va[0, :, position:, :] = 0
+            v_fixed.append(va)
+
+        for dev_set in [(self._sA, self._cA, self._kA, self._vA),
+                        (self._sB, self._cB, self._kB, self._vB)]:
+            ds, dc, dk, dv = dev_set
+            if self.nl_dn > 0:
+                _h2d(ds, s)
+                _h2d(dc, c)
+            if self.nl_ga > 0:
+                _h2d(dk, k_fixed)
+                _h2d(dv, v_fixed)
+
 
 class OmSplitEngine(SplitEngine):
     def __init__(self, model_id: str, max_len: int,
@@ -735,3 +817,24 @@ class OmSplitEngine(SplitEngine):
         self.runtime.bind_thread_context()
         logits = self.suffix.execute(hidden_state.astype(np.float16, copy=False).tobytes(), position)
         return logits.reshape(1, 1, -1)
+
+    def snapshot(self) -> tuple[CacheSnapshot | None, CacheSnapshot | None]:
+        if not self._loaded:
+            raise OmEngineError("engine not loaded")
+        snap_p = self.prefix.snapshot_segment() if self.prefix is not None else CacheSnapshot()
+        snap_s = self.suffix.snapshot_segment() if self.suffix is not None else CacheSnapshot()
+        return (snap_p if not snap_p.is_empty() else None,
+                snap_s if not snap_s.is_empty() else None)
+
+    def restore(self, prefix_snap: CacheSnapshot | None,
+                suffix_snap: CacheSnapshot | None, position: int) -> None:
+        if not self._loaded:
+            raise OmEngineError("engine not loaded")
+        assert self.runtime is not None
+        self.runtime.bind_thread_context()
+        if self.prefix is not None and prefix_snap is not None:
+            self.prefix.restore_segment(prefix_snap, position)
+            self.prefix.reset()
+        if self.suffix is not None and suffix_snap is not None:
+            self.suffix.restore_segment(suffix_snap, position)
+            self.suffix.reset()

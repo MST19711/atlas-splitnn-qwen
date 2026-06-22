@@ -74,13 +74,70 @@ layers[20:24] → Suffix (板端 OM, 1层DeltaNet + 3层GQA + LM Head)
 
 
 
-## Controller 设计：无状态多轮
+## Controller 设计：Prefix Cache 多对话复用
 
-控制器首版故意采用无状态多轮：每次请求都基于完整 `messages` 重新 prefill，不在请求之间保留 cache。理由：
+### 背景
 
-1. 与 OpenAI API 的无状态使用方式一致
-2. 不需要额外管理跨请求 session 存活、并发冲突和 cache 泄漏
-3. 先把"正确生成"与"统一接口"打通
+首版采用无状态多轮（每次请求基于完整 `messages` 重新 prefill）。但多轮对话中历史 token 序列是前缀扩展关系，逐 token 串行 prefill 造成大量重复计算。v1 引入基于 token 序列前缀的 KV cache 复用机制。
+
+### 设计要点
+
+**前缀 Trie 查找**：
+- 每次请求 tokenize 后得到的 `prompt_ids` 在 trie 中查找最长公共前缀
+- 若命中完整叶子节点（`match_len == entry.position`），恢复 DeltaNet S/C + GQA K/V 状态，跳过命中部分 prefill
+- 若未命中，从头 prefill，请求结束后将结果保存为新叶子
+
+**DeltaNet S/C 不可截断约束**：
+- DeltaNet 的 S(1,16,128,128)/C(1,6144,3) 是递归累积状态，无 position 维度
+- S_N 是 [t1..tN] 的累积压缩，无法从 S_M (M>N) 反推 S_N
+- 因此同一 cache entry 只能服务于完整叶节点匹配（match_len == entry.position）
+- 分叉场景（多对话共享 system prompt 后分叉）→ lookup 拒绝返回，走完整 rebuild
+
+**Copy-on-Write**：
+- 同一 entry 被多个并发请求 acquire 时（ref_count > 1），deep copy snapshot
+- 各请求独立 fork，不污染共享祖先状态
+
+**Prompt-only 中间快照**：
+- 每次请求 prefill 完成后立刻 snapshot（此时状态 = prompt 末尾位置）
+- 存入 trie 的 prompt token 节点，供相同 prompt 的后续请求直接命中
+- 命中时只需 prefill 最后一个 token 获取初始 logits，跳过整个 prompt 的逐 token prefill
+
+**LRU + TTL 淘汰**：
+- 纯内存（host RAM），不落盘
+- 最大条目数可配（默认 8），超限时淘汰最近最少使用的 ref_count==0 条目
+- TTL 兜底（默认 300s），防止僵尸 session 占用内存
+- 参考中段服务 SessionState 的 GC 模式
+
+### API 行为
+
+- OpenAI 协议不变（客户端只发 `messages`，无 session_id）
+- 响应头增加非标准字段：
+  - `X-Prefix-Cache-Status: hit|miss|disabled`
+  - `X-Prefix-Cache-Len: <matched_len>`
+- `--cache-disabled` 完全关闭，回退到每次从头 prefill
+
+### 加速效果
+
+| 场景 | 无 cache | 有 cache | 加速比 |
+|------|---------|---------|--------|
+| 短 prompt 重复 | 7.6s | 5.4s | 1.4x |
+| 长 prompt 重复 | 7.8s | 3.1s | 2.5x |
+| 多轮 follow-up 重复 | 14.5s | 5.4s | 2.7x |
+
+### 已知限制
+
+- **Chat template 重新编码**：多轮对话时 `chat_template` 对 assistant 回复文本重新 tokenize，BPE 分词边界可能与原始生成 token 不一致，导致 prefix 匹配在分叉点终止。此时 cache 正确降级为 miss+rebuild，不影响生成正确性，但不提供加速。
+- **仅完整叶子匹配**：v1 不支持分叉场景的懒快照（计划 v1.5 实现），分叉后需要完整 rebuild
+- **滑动窗口 v2 预留**：数据结构预留 `sliding_window_offset` 字段，未来配合 DeltaNet 线性层天然无限累积特性支持超长上下文
+
+### CLI 参数
+
+```
+--cache-disabled           # 关闭 prefix cache
+--cache-max-entries 8      # 最大缓存条目（默认 8）
+--cache-ttl-sec 300        # TTL 秒数（默认 300）
+--cache-min-prefix-len 8   # 最小命中前缀长度（默认 8）
+```
 
 ---
 

@@ -27,6 +27,13 @@
 │  │   └── RemoteMiddleClient  —— HTTP 远端中段协议       │
 │  └── _ACLSessionRuntime      —— ACL 底层封装            │
 └─────────────────────────────────────────────────────┘
+├─────────────────────────────────────────────────────┤
+│  Prefix Cache 子系统 (controller/cache/)             │
+│  ├── PrefixCacheRegistry —— Trie + LRU/TTL 容器      │
+│  ├── CacheEntry/CacheKey  —— 缓存条目与键            │
+│  ├── CacheSnapshot        —— S/C/K/V 状态快照        │
+│  └── 集成: runner 层 lookup→fork→restore→save 流程   │
+└─────────────────────────────────────────────────────┘
 ```
 
 三层职责分明：
@@ -174,6 +181,38 @@ OpenAIChatAdapter.run_non_stream() / run_stream()
 ```
 
 双缓冲机制：交替使用两组 cache 缓冲区（A/B），偶数步读 A 写 B，奇数步读 B 写 A，避免每步复制整个 cache。
+
+### Prefix Cache 流程
+
+```
+POST /v1/chat/completions
+  → tokenize(messages) → prompt_ids
+  → registry.lookup(prompt_ids)           # Trie 最长前缀查找
+    ├─ hit:  acquire(entry) → restore(snapshot) → delta-prefill
+    └─ miss: create_session() → full prefill
+  → decode loop (generate tokens)
+  → session.snapshot()                    # D2H 48 个 cache 张量 → host numpy
+  → registry.save(full_seq, snapshot)     # 存入 trie 叶节点
+  → prompt-only snapshot → registry.save  # 存入 trie 中间节点（同 prompt 复用）
+  → release(entry) → session.close()
+```
+
+处理流程：
+
+1. **lookup 阶段**：tokenize 后 `prompt_ids` 在 trie 中沿 token 路径下行，返回最深匹配叶节点
+2. **fork/acquire**：若 entry 已被其他请求使用（ref_count > 0），copy-on-write 深拷贝 snapshot
+3. **restore 阶段**：H2D 将 host snapshot 写回 device dataset（A/B 两组均写），清零 K/V 未填充区段
+4. **delta-prefill**：从 match_len 位置开始 prefill 新增 token（若全命中则只跑最后 1 token 获取初始 logits）
+5. **save 阶段**：请求结束后保存完整序列（prompt_ids + generated_ids）和 prompt-only 两个快照
+
+### 快照数据量
+
+| 模型 | S 状态 (18层) | C 状态 (18层) | K/V cache (6层) | 单条目总计 |
+|------|-------------|-------------|----------------|---------|
+| 0.8B max_len=256 | 9 MB | 0.6 MB | ~1.5 MB | ~11 MB |
+| 0.8B max_len=4096 | 9 MB | 0.6 MB | ~24 MB | ~34 MB |
+
+Registry 仅持有 host numpy 副本，不额外占用 NPU device 内存。
 
 ---
 
