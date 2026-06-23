@@ -184,6 +184,7 @@ def build_app(args) -> FastAPI:
         model_om=args.model_om,
         cache_disabled=getattr(args, "cache_disabled", False),
         cache_max_entries=getattr(args, "cache_max_entries", 8),
+        cache_max_bytes=getattr(args, "cache_max_bytes", 0),
         cache_ttl_sec=getattr(args, "cache_ttl_sec", 300),
         cache_min_prefix_len=getattr(args, "cache_min_prefix_len", 8),
     )
@@ -366,6 +367,8 @@ def main():
     parser.add_argument("--checksum", action="store_true")
     parser.add_argument("--cache-disabled", action="store_true")
     parser.add_argument("--cache-max-entries", type=int, default=8)
+    parser.add_argument("--cache-max-bytes", type=int, default=0,
+                        help="max total bytes for prefix cache snapshots (0=unlimited)")
     parser.add_argument("--cache-ttl-sec", type=int, default=300)
     parser.add_argument("--cache-min-prefix-len", type=int, default=8)
     args = parser.parse_args()

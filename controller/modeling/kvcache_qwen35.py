@@ -85,6 +85,7 @@ class _ACLSessionRuntime:
         self._c_b: list[int] = []
         self._k_b: list[int] = []
         self._v_b: list[int] = []
+        self._zero_cache_host: dict[int, np.ndarray] = {}
 
     @staticmethod
     def _build_layout(model_spec: ModelSpec, max_len: int) -> _KvLayout:
@@ -189,6 +190,36 @@ class _ACLSessionRuntime:
 
     def reset(self) -> None:
         self._step = 0
+
+    def prepare_fresh(self) -> None:
+        """Reset step state and zero both device-side cache sets for a new request."""
+        assert self.acl is not None
+        with self._lock:
+            self.bind_thread_context()
+            self._zero_cache_set(self._s_a, self.layout.s_bytes)
+            self._zero_cache_set(self._c_a, self.layout.c_bytes)
+            self._zero_cache_set(self._k_a, self.layout.kv_bytes)
+            self._zero_cache_set(self._v_a, self.layout.kv_bytes)
+            self._zero_cache_set(self._s_b, self.layout.s_bytes)
+            self._zero_cache_set(self._c_b, self.layout.c_bytes)
+            self._zero_cache_set(self._k_b, self.layout.kv_bytes)
+            self._zero_cache_set(self._v_b, self.layout.kv_bytes)
+            self._step = 0
+
+    def _zero_cache_set(self, dev_ptrs: list[int], size: int) -> None:
+        for dev_ptr in dev_ptrs:
+            self._zero_device_ptr(dev_ptr, size)
+
+    def _zero_device_ptr(self, dev_ptr: int, size: int) -> None:
+        memset = getattr(self.acl.rt, "memset", None)
+        if memset is not None:
+            _check(memset(dev_ptr, size, 0, size), "acl.rt.memset")
+            return
+        zero_host = self._zero_cache_host.get(size)
+        if zero_host is None:
+            zero_host = np.zeros(size, np.uint8)
+            self._zero_cache_host[size] = zero_host
+        _host_to_device(self.acl, dev_ptr, zero_host)
 
     def bind_thread_context(self) -> None:
         if self.acl is None or self._context is None:
@@ -327,11 +358,12 @@ class Qwen35KvCacheSession(Qwen35Session):
         self.runtime = runtime
         self.position = 0
         self.closed = False
-        self.runtime.reset()
+        self.runtime.prepare_fresh()
 
     def prefill(self, input_ids: list[int], position: int = 0) -> np.ndarray:
         if not input_ids:
             raise ValueError("empty input_ids")
+        self.position = position
         logits = None
         for token_id in input_ids:
             logits = self.decode_next(int(token_id))

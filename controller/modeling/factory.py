@@ -32,6 +32,7 @@ class BackendConfig:
     model_om: str
     cache_disabled: bool = False
     cache_max_entries: int = 8
+    cache_max_bytes: int = 0
     cache_ttl_sec: int = 300
     cache_min_prefix_len: int = 8
 
@@ -67,6 +68,7 @@ def _make_cache_registry(config: BackendConfig, middle_client=None) -> PrefixCac
         return None
     return PrefixCacheRegistry(
         max_entries=config.cache_max_entries,
+        max_cache_bytes=config.cache_max_bytes,
         ttl_sec=config.cache_ttl_sec,
         min_prefix_len=config.cache_min_prefix_len,
         tag=config.backend,

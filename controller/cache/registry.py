@@ -39,18 +39,20 @@ class TrieNode:
 
 
 class PrefixCacheRegistry:
-    """LRU + TTL container backed by a prefix trie."""
+    """LRU + TTL container backed by a prefix trie, with byte-level memory limit."""
 
     def __init__(
         self,
         *,
         max_entries: int = 8,
+        max_cache_bytes: int = 0,
         ttl_sec: float = 300.0,
         min_prefix_len: int = 8,
         tag: str = "default",
         middle_client=None,
     ):
         self.max_entries = max_entries
+        self.max_cache_bytes = max_cache_bytes
         self.ttl_sec = ttl_sec
         self.min_prefix_len = min_prefix_len
         self.tag = tag
@@ -59,6 +61,7 @@ class PrefixCacheRegistry:
         self._trie = TrieNode()
         self._by_hash: dict[int, CacheEntry] = {}
         self._lru_entries: list[CacheEntry] = []
+        self._total_bytes: int = 0
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._gc_thread = threading.Thread(target=self._gc_loop, daemon=True)
@@ -101,7 +104,11 @@ class PrefixCacheRegistry:
         """Bump ref_count; copy-on-write when entry already in use."""
         with self._lock:
             if entry.ref_count > 0:
+                old_bytes = entry.snapshot.byte_size()
                 new_snap = entry.snapshot.copy()
+                new_bytes = new_snap.byte_size()
+                self._total_bytes -= old_bytes
+                self._enforce_byte_limit_locked(new_bytes)
                 new_entry = CacheEntry(
                     key=entry.key,
                     backend_kind=entry.backend_kind,
@@ -114,6 +121,7 @@ class PrefixCacheRegistry:
                 self._by_hash[entry.key.full_hash] = new_entry
                 self._trie_insert(entry.key.token_seq, new_entry)
                 self._lru_insert(new_entry)
+                self._total_bytes += new_bytes
                 return new_entry
             entry.ref_count += 1
             entry.touch()
@@ -138,17 +146,22 @@ class PrefixCacheRegistry:
         if not token_seq:
             return None
         full_hash = self._hash_seq(token_seq)
+        snap_bytes = snapshot.byte_size()
         with self._lock:
             existing = self._by_hash.get(full_hash)
             if existing is not None:
+                delta = snap_bytes - existing.snapshot.byte_size()
                 existing.snapshot = snapshot
                 existing.middle_session_id = middle_session_id
                 existing.position = position
                 existing.touch()
                 self._lru_refresh(existing)
+                self._total_bytes += delta
+                self._enforce_byte_limit_locked()
                 return existing
             if len(self._by_hash) >= self.max_entries:
                 self._evict_one_lru_locked()
+            self._enforce_byte_limit_locked(snap_bytes)
             key = CacheKey(full_hash=full_hash, token_seq=token_seq)
             entry = CacheEntry(
                 key=key,
@@ -160,6 +173,7 @@ class PrefixCacheRegistry:
             self._by_hash[full_hash] = entry
             self._trie_insert(token_seq, entry)
             self._lru_insert(entry)
+            self._total_bytes += snap_bytes
             return entry
 
     def evict_one(self, entry: CacheEntry) -> None:
@@ -176,6 +190,8 @@ class PrefixCacheRegistry:
                 "tag": self.tag,
                 "entries": len(self._by_hash),
                 "max_entries": self.max_entries,
+                "max_cache_bytes": self.max_cache_bytes,
+                "current_cache_bytes": self._total_bytes,
                 "ttl_sec": self.ttl_sec,
                 "min_prefix_len": self.min_prefix_len,
                 "total_snapshot_bytes": sum(
@@ -251,11 +267,25 @@ class PrefixCacheRegistry:
             pass
         self._by_hash.pop(entry.key.full_hash, None)
         self._trie_remove(entry.key.token_seq)
+        self._total_bytes -= entry.snapshot.byte_size()
         if entry.middle_session_id and self.middle_client:
             try:
                 self.middle_client.close(entry.middle_session_id, evict=True)
             except Exception:
                 pass
+
+    def _enforce_byte_limit_locked(self, incoming_bytes: int = 0) -> None:
+        if self.max_cache_bytes <= 0:
+            return
+        while self._total_bytes + incoming_bytes > self.max_cache_bytes and self._lru_entries:
+            evicted = False
+            for e in list(self._lru_entries):
+                if e.ref_count == 0:
+                    self._evict_locked(e)
+                    evicted = True
+                    break
+            if not evicted:
+                break
 
     def _gc_loop(self) -> None:
         while not self._stop.wait(30.0):
