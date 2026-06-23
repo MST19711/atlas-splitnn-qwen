@@ -33,8 +33,8 @@ class FakeRemote:
     def __init__(self):
         self.calls = []
 
-    def open(self, session_id, prefix_hash=None, resume_token_pos=None):
-        self.calls.append(("open", session_id))
+    def open(self, session_id, prefix_hash=None, resume_token_pos=None, resume_from_session_id=None):
+        self.calls.append(("open", session_id, prefix_hash, resume_token_pos, resume_from_session_id))
 
     def close(self, session_id, evict=False):
         self.calls.append(("close", session_id))
@@ -119,10 +119,26 @@ class ModelingTests(unittest.TestCase):
         self.assertEqual(logits.shape, (1, 1, 1))
         self.assertEqual(engine.calls[0], "start_session")
         self.assertEqual(engine.calls[1], ("run_prefix", 11, 0))
+        self.assertEqual(remote.calls[0][0], "open")
         self.assertEqual(remote.calls[1][0], "step")
         session.close()
         self.assertEqual(engine.calls[-1], "end_session")
         self.assertEqual(remote.calls[-1][0], "close")
+
+    def test_splitnn_session_resume_opens_forked_remote_session(self):
+        engine = FakeEngine()
+        remote = FakeRemote()
+        session = SplitNNQwen35Session(
+            engine,
+            remote,
+            resume_session_id="cached-mid-session",
+            prefix_hash="12345",
+        )
+        self.assertNotEqual(session.session_id, "cached-mid-session")
+        self.assertEqual(
+            remote.calls[0],
+            ("open", session.session_id, "12345", None, "cached-mid-session"),
+        )
 
     def test_kvcache_session_position_continues_after_prefill(self):
         runtime = FakeRuntime()

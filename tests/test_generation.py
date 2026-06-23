@@ -8,6 +8,7 @@ from controller.generation.logits_processors import apply_presence_penalty, appl
 from controller.generation.runner import TokenGenerationRunner, apply_stop
 from controller.generation.config import SamplingParams
 from controller.modeling.base import ModelInfo, Qwen35Model, Qwen35Session
+from controller.cache.snapshot import CacheSnapshot
 
 
 class DummyTokenizer:
@@ -80,6 +81,26 @@ class DummyModel(Qwen35Model):
 
     def create_session(self, cache_entry=None):
         return self.session
+
+
+class RecordingRegistry:
+    def __init__(self):
+        self.saved = []
+
+    def lookup(self, token_seq):
+        return None, 0, 0
+
+    def save(self, token_seq, snapshot, middle_session_id=None, position=0):
+        self.saved.append((tuple(token_seq), middle_session_id, position, snapshot))
+
+
+class RemoteLikeSession(DummySession):
+    def __init__(self, logits_list):
+        super().__init__(logits_list)
+        self.session_id = "remote-session"
+
+    def snapshot(self):
+        return CacheSnapshot()
 
 
 def _logits(preferred_token: int, vocab_size: int = 100):
@@ -159,3 +180,24 @@ class GenerationTests(unittest.TestCase):
         steps = list(runner.generate([42], params))
         self.assertEqual([step.delta_text for step in steps[:-1]], ["¡"])
         self.assertEqual(steps[-1].finish_reason, "stop")
+
+    def test_generation_runner_skips_prompt_snapshot_for_remote_sessions(self):
+        session = RemoteLikeSession([_logits(1), _logits(99)])
+        model = DummyModel(session)
+        model.cache_registry = RecordingRegistry()
+        runner = TokenGenerationRunner(model=model, tokenizer=DummyTokenizer())
+        params = SamplingParams(
+            max_new_tokens=4,
+            temperature=0.0,
+            top_k=0,
+            top_p=1.0,
+            presence_penalty=0.0,
+            repetition_penalty=1.0,
+            stop=[],
+            enable_thinking=False,
+        )
+
+        list(runner.generate([42], params))
+
+        self.assertEqual(len(model.cache_registry.saved), 1)
+        self.assertEqual(model.cache_registry.saved[0][0], (42, 1))

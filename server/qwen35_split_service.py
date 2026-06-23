@@ -104,6 +104,25 @@ class SessionState:
             ],
         )
 
+    @classmethod
+    def clone_from(cls, source: "SessionState", session_id: str,
+                   aliases: set[str] | None = None) -> "SessionState":
+        cloned = cls(
+            session_id=session_id,
+            max_len=source.max_len,
+            device=source.device,
+            model_spec=source.model_spec,
+            nl_dn=source.nl_dn,
+            nl_ga=source.nl_ga,
+            position_next=source.position_next,
+            aliases=aliases or set(),
+            s_cache=[tensor.clone() for tensor in source.s_cache],
+            c_cache=[tensor.clone() for tensor in source.c_cache],
+            k_cache=[tensor.clone() for tensor in source.k_cache],
+            v_cache=[tensor.clone() for tensor in source.v_cache],
+        )
+        return cloned
+
     def flat_cache(self) -> list[torch.Tensor]:
         return [*self.s_cache, *self.c_cache, *self.k_cache, *self.v_cache]
 
@@ -204,7 +223,8 @@ class SplitService:
                 if session is None:
                     continue
                 for alias in session.aliases:
-                    self._alias_index.pop(alias, None)
+                    if self._alias_index.get(alias) == session_id:
+                        self._alias_index.pop(alias, None)
                 session.release()
                 released += 1
         if released:
@@ -282,27 +302,10 @@ class SplitService:
 
         prefix_hash = str(payload.get("prefix_hash", "")).strip()
         resume_pos = payload.get("resume_token_pos")
+        resume_from_session_id = str(payload.get("resume_from_session_id", "")).strip()
+        evict_ids: list[str] = []
 
         with self.sessions_lock:
-            if prefix_hash:
-                existing_id = self._alias_index.get(prefix_hash)
-                if existing_id is not None:
-                    session = self.sessions.get(existing_id)
-                    if session is not None:
-                        session.ref_count += 1
-                        session.last_access_at = time.time()
-                        if resume_pos is not None:
-                            session.position_next = int(resume_pos)
-                        return {
-                            "ok": True,
-                            "session_id": existing_id,
-                            "max_len": self.max_len,
-                            "hidden_size": self.hidden_size,
-                            "dtype": "fp16",
-                            "server_device": str(self.device),
-                            "session_resumed": True,
-                        }
-
             if session_id in self.sessions:
                 raise ApiError(HTTPStatus.CONFLICT, "SESSION_EXISTS", "session already exists")
             if len(self.sessions) >= self.max_sessions:
@@ -317,21 +320,41 @@ class SplitService:
                         "TOO_MANY_SESSIONS",
                         f"active sessions exceed limit {self.max_sessions}",
                     )
-                for sid in expired[:1]:
-                    self._release_sessions([sid])
+                evict_ids.extend(expired[:1])
 
-            aliases = {prefix_hash} if prefix_hash else set()
-            session = SessionState.create(
-                session_id, self.max_len, self.device,
-                self.model_spec, self.mid_nl_dn, self.mid_nl_ga,
-                aliases=aliases,
-            )
+            source_session = None
+            session_resumed = False
+            if resume_from_session_id:
+                source_session = self.sessions.get(resume_from_session_id)
+                if source_session is None:
+                    raise ApiError(HTTPStatus.NOT_FOUND, "SESSION_NOT_FOUND", "resume source session not found")
+                session_resumed = True
+            elif prefix_hash:
+                existing_id = self._alias_index.get(prefix_hash)
+                if existing_id is not None:
+                    source_session = self.sessions.get(existing_id)
+                    if source_session is not None:
+                        session_resumed = True
+
+            aliases = {prefix_hash} if prefix_hash and not session_resumed else set()
+            if source_session is not None:
+                with source_session.lock:
+                    session = SessionState.clone_from(source_session, session_id, aliases=aliases)
+            else:
+                session = SessionState.create(
+                    session_id, self.max_len, self.device,
+                    self.model_spec, self.mid_nl_dn, self.mid_nl_ga,
+                    aliases=aliases,
+                )
             if resume_pos is not None:
                 session.position_next = int(resume_pos)
             session.ref_count = 1
+            session.last_access_at = time.time()
             self.sessions[session_id] = session
             for alias in aliases:
                 self._alias_index[alias] = session_id
+        if evict_ids:
+            self._release_sessions(evict_ids)
 
         return {
             "ok": True,
@@ -343,7 +366,7 @@ class SplitService:
             "server_model_segment": (
                 f"layers[{self.split_config.prefix_end}:{self.split_config.suffix_start}]"
             ),
-            "session_resumed": False,
+            "session_resumed": session_resumed,
         }
 
     def close_session(self, payload: dict) -> dict:
@@ -351,6 +374,7 @@ class SplitService:
         if not session_id:
             raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_SESSION_ID", "missing session_id")
         evict = payload.get("evict", False)
+        release_after_unlock = False
         with self.sessions_lock:
             session = self.sessions.get(session_id)
             if session is None:
@@ -359,8 +383,10 @@ class SplitService:
                 session.ref_count -= 1
             session.last_access_at = time.time()
             if evict:
-                released = self._release_sessions([session_id]) > 0
-                return {"ok": True, "session_id": session_id, "released": released}
+                release_after_unlock = True
+        if release_after_unlock:
+            released = self._release_sessions([session_id]) > 0
+            return {"ok": True, "session_id": session_id, "released": released}
         return {"ok": True, "session_id": session_id, "released": False}
 
     def step_session(self, headers, body: bytes) -> tuple[bytes, dict]:

@@ -18,12 +18,14 @@ class SplitNNQwen35Session(Qwen35Session):
         self.position = 0
         self._closed = False
         self._prefix_hash = prefix_hash
-        if resume_session_id:
-            self.session_id = resume_session_id
-        else:
-            self.session_id = uuid.uuid4().hex
+        self._resume_session_id = resume_session_id
+        self.session_id = uuid.uuid4().hex
         self.engine.start_session()
-        self.remote_middle.open(self.session_id, prefix_hash=prefix_hash)
+        self.remote_middle.open(
+            self.session_id,
+            prefix_hash=prefix_hash,
+            resume_from_session_id=resume_session_id,
+        )
 
     def prefill(self, input_ids: list[int], position: int = 0) -> np.ndarray:
         if not input_ids:

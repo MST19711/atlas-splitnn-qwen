@@ -47,7 +47,8 @@ class RemoteMiddleClient:
             return json.loads(resp.read().decode("utf-8"))
 
     def open(self, session_id: str, prefix_hash: str | None = None,
-             resume_token_pos: int | None = None) -> dict:
+             resume_token_pos: int | None = None,
+             resume_from_session_id: str | None = None) -> dict:
         payload: dict = {
             "session_id": session_id,
             "model": self.model_name,
@@ -60,6 +61,8 @@ class RemoteMiddleClient:
             payload["prefix_hash"] = prefix_hash
         if resume_token_pos is not None:
             payload["resume_token_pos"] = resume_token_pos
+        if resume_from_session_id is not None:
+            payload["resume_from_session_id"] = resume_from_session_id
         return self._request_json("/v1/session/open", payload)
 
     def close(self, session_id: str, evict: bool = False) -> dict:

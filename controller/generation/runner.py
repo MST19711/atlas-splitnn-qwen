@@ -129,6 +129,7 @@ class TokenGenerationRunner:
 
         generated_ids: list[int] = []
         prompt_snap = None
+        supports_prompt_snapshot = True
         try:
             self.raise_if_cancelled(cancel_event)
             if delta_ids:
@@ -137,7 +138,11 @@ class TokenGenerationRunner:
                 # Prompt fully cached – run last token to get first decode logits
                 session.position = start_pos - 1
                 current_logits = session.prefill([prompt_ids[-1]], position=start_pos - 1)
-            if registry is not None and len(prompt_ids) > 0 and delta_ids and start_pos == 0:
+            # SplitNN's remote middle session is mutable runtime state rather than an
+            # immutable snapshot handle, so prompt-only snapshots would pair local
+            # prefix/suffix cache with a mismatched remote middle state.
+            supports_prompt_snapshot = not hasattr(session, "session_id")
+            if registry is not None and supports_prompt_snapshot and len(prompt_ids) > 0 and delta_ids and start_pos == 0:
                 try:
                     prompt_snap = session.snapshot()
                 except Exception:
@@ -210,7 +215,7 @@ class TokenGenerationRunner:
                     )
                 except Exception:
                     pass
-                if prompt_snap is not None:
+                if prompt_snap is not None and supports_prompt_snapshot:
                     try:
                         mid_sid = getattr(session, 'session_id', None)
                         registry.save(
