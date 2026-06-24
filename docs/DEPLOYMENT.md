@@ -25,7 +25,7 @@
 ├── qwen3.5_kvcache_max256.om     # KV Cache OM 模型（1.9GB）
 ├── config.json                   # Qwen3.5 模型配置
 ├── tokenizer.json, vocab.json, merges.txt, tokenizer_config.json, chat_template.jinja
-└── run_openai_kvcache_controller.sh
+└── run_kvcache_4096.sh
 ```
 
 ### SplitNN OM
@@ -67,7 +67,7 @@
 
 | 脚本 | 后端 | 说明 |
 |------|------|------|
-| `run_openai_kvcache_controller.sh` | `qwen35_kvcache_om` | 纯板端 KV Cache，当前脚本示例为 256 tok |
+| `run_kvcache_4096.sh` | `qwen35_kvcache_om` | 纯板端 KV Cache，4096 tok，100MB cache 限制 |
 | `run_openai_split_controller_om.sh` | `splitnn_om` | SplitNN OM，当前脚本示例为较短上下文 |
 | `run_openai_split_controller_om_16k.sh` | `splitnn_om` | SplitNN OM，当前脚本示例为 16K |
 | `run_openai_split_controller_bound_2b.sh` | `splitnn_bound_embed_head` | 参数绑定，当前脚本示例为 2B `0/24/0` |

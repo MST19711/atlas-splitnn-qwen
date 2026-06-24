@@ -103,7 +103,7 @@ MODEL_ONNX=om_out/qwen3.5_kvcache_max256.onnx \
   bash scripts/podman_convert.sh
 
 # 3. 上传并启动 (板端)
-cd /root/slm_deploy && bash run_openai_kvcache_controller.sh
+cd /root/slm_deploy && bash run_kvcache_4096.sh
 
 # 4. 测试
 curl http://127.0.0.1:8000/v1/chat/completions \

@@ -43,7 +43,7 @@ pixi run python -m pytest tests/ -v
 pixi run python -m pytest tests/test_prefix_cache_*.py -v
 
 # 板端多轮对话验证（两轮 curl）
-# 启动服务：bash /root/slm_deploy/run_openai_kvcache_controller.sh
+# 启动服务：bash /root/slm_deploy/run_kvcache_4096.sh
 # 第一轮：
 curl -i -X POST http://192.168.137.100:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -55,7 +55,7 @@ curl -i -X POST http://192.168.137.100:8000/v1/chat/completions \
 # 第二轮响应头应含有 X-Prefix-Cache-Status: hit
 
 # cache-disabled 回退
-cd /root/slm_deploy && bash run_openai_kvcache_controller.sh --cache-disabled
+cd /root/slm_deploy && bash run_kvcache_4096.sh --cache-disabled
 
 # 可选 cache 参数
 # --cache-max-entries 8 --cache-ttl-sec 300 --cache-min-prefix-len 8
@@ -63,8 +63,8 @@ cd /root/slm_deploy && bash run_openai_kvcache_controller.sh --cache-disabled
 
 ### 板端部署
 ```bash
-cd /root/slm_deploy && bash run_openai_kvcache_controller.sh  # 纯板端 KV Cache (推荐)
-cd /root/slm_deploy && bash run_openai_kvcache_controller.sh --cache-disabled  # 关闭 prefix cache
+cd /root/slm_deploy && bash run_kvcache_4096.sh  # 纯板端 KV Cache (推荐)
+cd /root/slm_deploy && bash run_kvcache_4096.sh --cache-disabled  # 关闭 prefix cache
 cd /root/slm_deploy && bash run_openai_split_controller_bound_2b.sh  # 参数绑定 2B
 ```
 

@@ -33,3 +33,5 @@ tmp*
 cmd.txtop_models_config/
 .pytest_cache/._*
 om_out.tar
+.playwright-mcp/
+.pytest_cache

@@ -92,10 +92,10 @@ sshpass -p 'Mind@123' scp -o StrictHostKeyChecking=no \
 
 # 启动脚本
 sshpass -p 'Mind@123' scp -o StrictHostKeyChecking=no \
-  board/run_openai_kvcache_controller.sh \
+  board/run_kvcache_4096.sh \
   root@192.168.137.100:/root/slm_deploy/
 sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no root@192.168.137.100 \
-  'chmod +x /root/slm_deploy/run_openai_kvcache_controller.sh'
+  'chmod +x /root/slm_deploy/run_kvcache_4096.sh'
 ```
 
 ### 4. 板端启动
@@ -103,7 +103,7 @@ sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no root@192.168.137.100 \
 ```bash
 # 登录开发板
 cd /root/slm_deploy
-bash run_openai_kvcache_controller.sh
+bash run_kvcache_4096.sh
 ```
 
 模型加载约 210 秒，就绪后监听 `http://0.0.0.0:8000`。
@@ -160,7 +160,7 @@ curl http://127.0.0.1:8000/v1/models
 
 常见默认模型名（以仓库内启动脚本为准）：
 
-- `run_openai_kvcache_controller.sh` → `qwen3.5-0.8B-kvcache-om`
+- `run_kvcache_4096.sh` → `qwen3.5-0.8B-kvcache-om`
 - `run_openai_split_controller_om.sh` → `qwen3.5-split-4-16-4-om`
 - `run_openai_split_controller_om_16k.sh` → `qwen3.5-split-4-16-4-om-16k`
 - `run_openai_split_controller_bound_2b.sh` → `qwen3.5-2b-split-0-24-0-om`
