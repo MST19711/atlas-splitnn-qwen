@@ -7,6 +7,7 @@
 - `root@192.168.137.100`, 密码 `Mind@123`, Atlas 200I DK A2 (Ascend310B4)
 - SSH: `sshpass -p 'Mind@123' ssh -o StrictHostKeyChecking=no root@192.168.137.100 '<cmd>'`
 - SCP: `sshpass -p 'Mind@123' scp <local> root@192.168.137.100:/root/slm_deploy/`
+- **禁止直接在板端修改文件**：不得使用 `ssh ... 'sed -i'`、`ssh ... 'echo "..." > file'`、`ssh ... 'vim'` 等方式直接编辑板端文件。所有代码变更必须在本地项目中完成，通过 SCP 传输到板端。这是为了保证本地项目是唯一可信的代码源，本地与板端内容一致。
 - NPU 进程被 kill 后驱动不清理 → 重启板子
 
 ## Python 环境
